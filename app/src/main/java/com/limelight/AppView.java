@@ -70,6 +70,7 @@ public class AppView extends Activity implements AdapterFragmentCallbacks {
     private final static int VIEW_DETAILS_ID = 5;
     private final static int CREATE_SHORTCUT_ID = 6;
     private final static int HIDE_APP_ID = 7;
+    private final static int START_AUDIO_ONLY_ID = 8;
 
     public final static String HIDDEN_APPS_PREF_FILENAME = "HiddenApps";
 
@@ -407,6 +408,8 @@ public class AppView extends Activity implements AdapterFragmentCallbacks {
             }
         }
 
+        menu.add(Menu.NONE, START_AUDIO_ONLY_ID, 2, getResources().getString(R.string.applist_menu_start_audio_only));
+
         // Only show the hide checkbox if this is not the currently running app or it's already hidden
         if (lastRunningAppId != selectedApp.app.getAppId() || selectedApp.isHidden) {
             MenuItem hideAppItem = menu.add(Menu.NONE, HIDE_APP_ID, 3, getResources().getString(R.string.applist_menu_hide_app));
@@ -453,6 +456,20 @@ public class AppView extends Activity implements AdapterFragmentCallbacks {
             case START_OR_RESUME_ID:
                 // Resume is the same as start for us
                 ServerHelper.doStart(AppView.this, app.app, computer, managerBinder);
+                return true;
+
+            case START_AUDIO_ONLY_ID:
+                if (lastRunningAppId != 0 && lastRunningAppId != app.app.getAppId()) {
+                    UiHelper.displayQuitConfirmationDialog(this, new Runnable() {
+                        @Override
+                        public void run() {
+                            ServerHelper.doStart(AppView.this, app.app, computer, managerBinder, true);
+                        }
+                    }, null);
+                }
+                else {
+                    ServerHelper.doStart(AppView.this, app.app, computer, managerBinder, true);
+                }
                 return true;
 
             case QUIT_ID:

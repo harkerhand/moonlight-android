@@ -34,4 +34,8 @@
         <item name="android:windowNoTitle">true</item>
     </style>
 
+    <style name="AudioOnlyPlayerTheme" parent="AppTheme">
+        <item name="android:windowBackground">#181A1F</item>
+    </style>
+
 </resources>

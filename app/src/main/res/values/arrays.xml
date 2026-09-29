@@ -43,6 +43,32 @@
         <item>71</item>
     </string-array>
 
+    <string-array name="audio_only_video_resolution_names">
+        <item>@string/audio_only_resolution_320x180</item>
+        <item>@string/audio_only_resolution_160x90</item>
+        <item>@string/audio_only_resolution_32x18</item>
+        <item>@string/audio_only_resolution_16x16</item>
+        <item>@string/audio_only_resolution_2x2</item>
+    </string-array>
+    <string-array name="audio_only_video_resolution_values" translatable="false">
+        <item>320x180</item>
+        <item>160x90</item>
+        <item>32x18</item>
+        <item>16x16</item>
+        <item>2x2</item>
+    </string-array>
+
+    <string-array name="audio_only_video_fps_names" translatable="false">
+        <item>10 FPS</item>
+        <item>5 FPS</item>
+        <item>2 FPS</item>
+    </string-array>
+    <string-array name="audio_only_video_fps_values" translatable="false">
+        <item>10</item>
+        <item>5</item>
+        <item>2</item>
+    </string-array>
+
     <!-- Don't forget to update locales_config.xml when you modify this! -->
     <string-array name="language_names" translatable="false">
         <item>Default</item>

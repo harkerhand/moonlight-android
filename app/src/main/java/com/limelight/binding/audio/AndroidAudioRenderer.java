@@ -15,19 +15,56 @@ import com.limelight.nvstream.jni.MoonBridge;
 
 public class AndroidAudioRenderer implements AudioRenderer {
 
+    public static final class PerformanceSnapshot {
+        public final float averageWriteTimeMs;
+        public final float maximumWriteTimeMs;
+
+        private PerformanceSnapshot(float averageWriteTimeMs, float maximumWriteTimeMs) {
+            this.averageWriteTimeMs = averageWriteTimeMs;
+            this.maximumWriteTimeMs = maximumWriteTimeMs;
+        }
+    }
+
     private final Context context;
     private final boolean enableAudioFx;
+    private final int audioUsage;
+    private final int audioContentType;
+    private final int audioEffectContentType;
+    private final boolean enablePerformanceMetrics;
+    private final Object performanceMetricsLock = new Object();
+    private final Object trackLock = new Object();
 
-    private AudioTrack track;
+    private volatile AudioTrack track;
+    private volatile float volume = 1.0f;
+    private long writeTimeNs;
+    private long maximumWriteTimeNs;
+    private long writeCount;
 
     public AndroidAudioRenderer(Context context, boolean enableAudioFx) {
+        this(context, enableAudioFx, AudioAttributes.USAGE_GAME,
+                AudioAttributes.CONTENT_TYPE_UNKNOWN, AudioEffect.CONTENT_TYPE_GAME);
+    }
+
+    public AndroidAudioRenderer(Context context, boolean enableAudioFx, int audioUsage,
+                                int audioContentType, int audioEffectContentType) {
+        this(context, enableAudioFx, audioUsage, audioContentType, audioEffectContentType, false);
+    }
+
+    public AndroidAudioRenderer(Context context, boolean enableAudioFx, int audioUsage,
+                                int audioContentType, int audioEffectContentType,
+                                boolean enablePerformanceMetrics) {
         this.context = context;
         this.enableAudioFx = enableAudioFx;
+        this.audioUsage = audioUsage;
+        this.audioContentType = audioContentType;
+        this.audioEffectContentType = audioEffectContentType;
+        this.enablePerformanceMetrics = enablePerformanceMetrics;
     }
 
     private AudioTrack createAudioTrack(int channelConfig, int sampleRate, int bufferSize, boolean lowLatency) {
         AudioAttributes.Builder attributesBuilder = new AudioAttributes.Builder()
-                .setUsage(AudioAttributes.USAGE_GAME);
+                .setUsage(audioUsage)
+                .setContentType(audioContentType);
         AudioFormat format = new AudioFormat.Builder()
                 .setEncoding(AudioFormat.ENCODING_PCM_16BIT)
                 .setSampleRate(sampleRate)
@@ -160,6 +197,7 @@ public class AndroidAudioRenderer implements AudioRenderer {
 
             try {
                 track = createAudioTrack(channelConfig, sampleRate, bufferSize, lowLatency);
+                track.setVolume(volume);
                 track.play();
 
                 // Successfully created working AudioTrack. We're done here.
@@ -188,14 +226,63 @@ public class AndroidAudioRenderer implements AudioRenderer {
     @Override
     public void playDecodedAudio(short[] audioData) {
         // Only queue up to 40 ms of pending audio data in addition to what AudioTrack is buffering for us.
-        if (MoonBridge.getPendingAudioDuration() < 40) {
+        int pendingAudioDuration = MoonBridge.getPendingAudioDuration();
+        if (pendingAudioDuration < 40) {
             // This will block until the write is completed. That can cause a backlog
             // of pending audio data, so we do the above check to be able to bound
             // latency at 40 ms in that situation.
-            track.write(audioData, 0, audioData.length);
+            AudioTrack currentTrack = track;
+            if (currentTrack == null) {
+                return;
+            }
+
+            if (enablePerformanceMetrics) {
+                long writeStartNs = System.nanoTime();
+                currentTrack.write(audioData, 0, audioData.length);
+                long elapsedNs = System.nanoTime() - writeStartNs;
+                synchronized (performanceMetricsLock) {
+                    writeTimeNs += elapsedNs;
+                    maximumWriteTimeNs = Math.max(maximumWriteTimeNs, elapsedNs);
+                    writeCount++;
+                }
+            }
+            else {
+                currentTrack.write(audioData, 0, audioData.length);
+            }
         }
         else {
-            LimeLog.info("Too much pending audio data: " + MoonBridge.getPendingAudioDuration() +" ms");
+            LimeLog.info("Too much pending audio data: " + pendingAudioDuration +" ms");
+        }
+    }
+
+    public PerformanceSnapshot getPerformanceSnapshot() {
+        if (!enablePerformanceMetrics) {
+            return null;
+        }
+
+        final float averageWriteTimeMs;
+        final float maximumWriteTimeMs;
+        synchronized (performanceMetricsLock) {
+            averageWriteTimeMs = writeCount > 0 ?
+                    (float) writeTimeNs / writeCount / 1_000_000.0f : Float.NaN;
+            maximumWriteTimeMs = writeCount > 0 ?
+                    (float) maximumWriteTimeNs / 1_000_000.0f : Float.NaN;
+            writeTimeNs = 0;
+            maximumWriteTimeNs = 0;
+            writeCount = 0;
+        }
+
+        return new PerformanceSnapshot(averageWriteTimeMs, maximumWriteTimeMs);
+    }
+
+    public void setVolume(float volume) {
+        this.volume = volume;
+
+        synchronized (trackLock) {
+            AudioTrack currentTrack = track;
+            if (currentTrack != null) {
+                currentTrack.setVolume(volume);
+            }
         }
     }
 
@@ -206,7 +293,7 @@ public class AndroidAudioRenderer implements AudioRenderer {
             Intent i = new Intent(AudioEffect.ACTION_OPEN_AUDIO_EFFECT_CONTROL_SESSION);
             i.putExtra(AudioEffect.EXTRA_AUDIO_SESSION, track.getAudioSessionId());
             i.putExtra(AudioEffect.EXTRA_PACKAGE_NAME, context.getPackageName());
-            i.putExtra(AudioEffect.EXTRA_CONTENT_TYPE, AudioEffect.CONTENT_TYPE_GAME);
+            i.putExtra(AudioEffect.EXTRA_CONTENT_TYPE, audioEffectContentType);
             context.sendBroadcast(i);
         }
     }
@@ -224,10 +311,16 @@ public class AndroidAudioRenderer implements AudioRenderer {
 
     @Override
     public void cleanup() {
-        // Immediately drop all pending data
-        track.pause();
-        track.flush();
-
-        track.release();
+        final AudioTrack currentTrack;
+        synchronized (trackLock) {
+            currentTrack = track;
+            track = null;
+        }
+        if (currentTrack != null) {
+            // Immediately drop all pending data
+            currentTrack.pause();
+            currentTrack.flush();
+            currentTrack.release();
+        }
     }
 }

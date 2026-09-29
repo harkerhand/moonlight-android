@@ -40,6 +40,9 @@ public class PreferenceConfiguration {
     private static final String SMALL_ICONS_PREF_STRING = "checkbox_small_icon_mode";
     private static final String MULTI_CONTROLLER_PREF_STRING = "checkbox_multi_controller";
     static final String AUDIO_CONFIG_PREF_STRING = "list_audio_config";
+    private static final String AUDIO_ONLY_VIDEO_RESOLUTION_PREF_STRING = "list_audio_only_video_resolution";
+    private static final String AUDIO_ONLY_VIDEO_FPS_PREF_STRING = "list_audio_only_video_fps";
+    private static final String AUDIO_ONLY_VIDEO_BITRATE_PREF_STRING = "seekbar_audio_only_video_bitrate_kbps";
     private static final String USB_DRIVER_PREF_SRING = "checkbox_usb_driver";
     private static final String VIDEO_FORMAT_PREF_STRING = "video_format";
     private static final String ONSCREEN_CONTROLLER_PREF_STRING = "checkbox_show_onscreen_controls";
@@ -99,6 +102,9 @@ public class PreferenceConfiguration {
     private static final boolean DEFAULT_FLIP_FACE_BUTTONS = false;
     private static final boolean DEFAULT_TOUCHSCREEN_TRACKPAD = true;
     private static final String DEFAULT_AUDIO_CONFIG = "2"; // Stereo
+    private static final String DEFAULT_AUDIO_ONLY_VIDEO_RESOLUTION = "320x180";
+    private static final int DEFAULT_AUDIO_ONLY_VIDEO_FPS = 10;
+    private static final int DEFAULT_AUDIO_ONLY_VIDEO_BITRATE = 100;
     private static final boolean DEFAULT_LATENCY_TOAST = false;
     private static final String DEFAULT_FRAME_PACING = "latency";
     private static final boolean DEFAULT_ABSOLUTE_MOUSE_MODE = false;
@@ -147,6 +153,7 @@ public class PreferenceConfiguration {
     public int vibrateFallbackToDeviceStrength;
     public boolean touchscreenTrackpad;
     public MoonBridge.AudioConfiguration audioConfiguration;
+    public int audioOnlyVideoWidth, audioOnlyVideoHeight, audioOnlyVideoFps, audioOnlyVideoBitrate;
     public int framePacing;
     public boolean absoluteMouseMode;
     public boolean enableAudioFx;
@@ -254,6 +261,12 @@ public class PreferenceConfiguration {
             case 2160:
                 return RES_4K;
         }
+    }
+
+    private static boolean isValidAudioOnlyVideoResolution(String resolution) {
+        return resolution.equals("2x2") || resolution.equals("16x16") ||
+                resolution.equals("32x18") || resolution.equals("160x90") ||
+                resolution.equals("320x180");
     }
 
     public static int getDefaultBitrate(String resString, String fpsString) {
@@ -557,6 +570,48 @@ public class PreferenceConfiguration {
         }
         else /* if (audioConfig.equals("2")) */ {
             config.audioConfiguration = MoonBridge.AUDIO_CONFIGURATION_STEREO;
+        }
+
+        String audioOnlyResolution;
+        try {
+            audioOnlyResolution = prefs.getString(AUDIO_ONLY_VIDEO_RESOLUTION_PREF_STRING,
+                    DEFAULT_AUDIO_ONLY_VIDEO_RESOLUTION);
+            if (!isValidAudioOnlyVideoResolution(audioOnlyResolution)) {
+                throw new IllegalArgumentException("Unsupported audio-only video resolution");
+            }
+            config.audioOnlyVideoWidth = getWidthFromResolutionString(audioOnlyResolution);
+            config.audioOnlyVideoHeight = getHeightFromResolutionString(audioOnlyResolution);
+        } catch (RuntimeException e) {
+            config.audioOnlyVideoWidth = getWidthFromResolutionString(DEFAULT_AUDIO_ONLY_VIDEO_RESOLUTION);
+            config.audioOnlyVideoHeight = getHeightFromResolutionString(DEFAULT_AUDIO_ONLY_VIDEO_RESOLUTION);
+            prefs.edit().putString(AUDIO_ONLY_VIDEO_RESOLUTION_PREF_STRING,
+                    DEFAULT_AUDIO_ONLY_VIDEO_RESOLUTION).apply();
+        }
+
+        try {
+            config.audioOnlyVideoFps = Integer.parseInt(prefs.getString(
+                    AUDIO_ONLY_VIDEO_FPS_PREF_STRING, Integer.toString(DEFAULT_AUDIO_ONLY_VIDEO_FPS)));
+            if (config.audioOnlyVideoFps != 2 && config.audioOnlyVideoFps != 5 &&
+                    config.audioOnlyVideoFps != 10) {
+                throw new IllegalArgumentException("Unsupported audio-only video frame rate");
+            }
+        } catch (RuntimeException e) {
+            config.audioOnlyVideoFps = DEFAULT_AUDIO_ONLY_VIDEO_FPS;
+            prefs.edit().putString(AUDIO_ONLY_VIDEO_FPS_PREF_STRING,
+                    Integer.toString(DEFAULT_AUDIO_ONLY_VIDEO_FPS)).apply();
+        }
+
+        try {
+            config.audioOnlyVideoBitrate = prefs.getInt(AUDIO_ONLY_VIDEO_BITRATE_PREF_STRING,
+                    DEFAULT_AUDIO_ONLY_VIDEO_BITRATE);
+            if (config.audioOnlyVideoBitrate < 10 || config.audioOnlyVideoBitrate > 1000 ||
+                    config.audioOnlyVideoBitrate % 10 != 0) {
+                throw new IllegalArgumentException("Unsupported audio-only video bitrate");
+            }
+        } catch (RuntimeException e) {
+            config.audioOnlyVideoBitrate = DEFAULT_AUDIO_ONLY_VIDEO_BITRATE;
+            prefs.edit().putInt(AUDIO_ONLY_VIDEO_BITRATE_PREF_STRING,
+                    DEFAULT_AUDIO_ONLY_VIDEO_BITRATE).apply();
         }
 
         config.videoFormat = getVideoFormatValue(context);
