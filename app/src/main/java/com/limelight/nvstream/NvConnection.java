@@ -48,6 +48,11 @@ public class NvConnection {
     private static Semaphore connectionAllowed = new Semaphore(1);
     private final boolean isMonkey;
     private final Context appContext;
+    private final Object lifecycleLock = new Object();
+    private volatile boolean stopRequested;
+    private Thread startThread;
+    private boolean connectionPermitHeld;
+    private boolean bridgeConfigured;
 
     public NvConnection(Context appContext, ComputerDetails.AddressTuple host, int httpsPort, String uniqueId, StreamConfiguration config, LimelightCryptoProvider cryptoProvider, X509Certificate serverCert)
     {
@@ -87,18 +92,93 @@ public class NvConnection {
     }
 
     public void stop() {
-        // Interrupt any pending connection. This is thread-safe.
-        MoonBridge.interruptConnection();
+        Thread threadToInterrupt;
+        boolean ownsConnectionPermit;
+        synchronized (lifecycleLock) {
+            if (stopRequested) {
+                return;
+            }
+            stopRequested = true;
+            threadToInterrupt = startThread;
+            ownsConnectionPermit = connectionPermitHeld;
+            if (ownsConnectionPermit) {
+                // Transfer responsibility for releasing the permit to this stop path. This
+                // prevents the start thread from releasing it while native teardown is active.
+                connectionPermitHeld = false;
+            }
+        }
+
+        if (threadToInterrupt != null && threadToInterrupt != Thread.currentThread()) {
+            threadToInterrupt.interrupt();
+        }
+
+        // Interrupt only the native connection owned by this instance. Another instance may
+        // be waiting for the global permit and must not interrupt the active owner.
+        if (ownsConnectionPermit) {
+            MoonBridge.interruptConnection();
+        }
 
         // Moonlight-core is not thread-safe with respect to connection start and stop, so
         // we must not invoke that functionality in parallel.
         synchronized (MoonBridge.class) {
-            MoonBridge.stopConnection();
-            MoonBridge.cleanupBridge();
+            boolean shouldCleanupBridge;
+            synchronized (lifecycleLock) {
+                shouldCleanupBridge = bridgeConfigured;
+            }
+            if (shouldCleanupBridge) {
+                MoonBridge.stopConnection();
+                MoonBridge.cleanupBridge();
+                synchronized (lifecycleLock) {
+                    bridgeConfigured = false;
+                }
+            }
         }
 
-        // Now a pending connection can be processed
-        connectionAllowed.release();
+        if (threadToInterrupt != null && threadToInterrupt != Thread.currentThread()) {
+            boolean interrupted = false;
+            while (threadToInterrupt.isAlive()) {
+                try {
+                    threadToInterrupt.join();
+                } catch (InterruptedException e) {
+                    interrupted = true;
+                }
+            }
+            if (interrupted) {
+                Thread.currentThread().interrupt();
+            }
+        }
+
+        if (ownsConnectionPermit) {
+            connectionAllowed.release();
+        }
+    }
+
+    private boolean isStopRequested() {
+        return stopRequested;
+    }
+
+    private boolean acquireConnectionPermit() throws InterruptedException {
+        connectionAllowed.acquire();
+
+        synchronized (lifecycleLock) {
+            if (stopRequested) {
+                connectionAllowed.release();
+                return false;
+            }
+            connectionPermitHeld = true;
+            return true;
+        }
+    }
+
+    private void releaseConnectionPermit() {
+        boolean shouldRelease;
+        synchronized (lifecycleLock) {
+            shouldRelease = connectionPermitHeld;
+            connectionPermitHeld = false;
+        }
+        if (shouldRelease) {
+            connectionAllowed.release();
+        }
     }
 
     private InetAddress resolveServerAddress() throws IOException {
@@ -383,67 +463,113 @@ public class NvConnection {
     {
         new Thread(new Runnable() {
             public void run() {
-                context.connListener = connectionListener;
-                context.videoCapabilities = videoDecoderRenderer.getCapabilities();
-
-                String appName = context.streamConfig.getApp().getAppName();
-
-                context.connListener.stageStarting(appName);
-
-                try {
-                    if (!startApp()) {
-                        context.connListener.stageFailed(appName, 0, 0);
+                synchronized (lifecycleLock) {
+                    if (stopRequested) {
                         return;
                     }
-                    context.connListener.stageComplete(appName);
-                } catch (HostHttpResponseException e) {
-                    e.printStackTrace();
-                    context.connListener.displayMessage(e.getMessage());
-                    context.connListener.stageFailed(appName, 0, e.getErrorCode());
-                    return;
-                } catch (XmlPullParserException | IOException e) {
-                    e.printStackTrace();
-                    context.connListener.displayMessage(e.getMessage());
-                    context.connListener.stageFailed(appName, MoonBridge.ML_PORT_FLAG_TCP_47984 | MoonBridge.ML_PORT_FLAG_TCP_47989, 0);
-                    return;
+                    startThread = Thread.currentThread();
                 }
 
-                ByteBuffer ib = ByteBuffer.allocate(16);
-                ib.putInt(context.riKeyId);
-
-                // Acquire the connection semaphore to ensure we only have one
-                // connection going at once.
                 try {
-                    connectionAllowed.acquire();
-                } catch (InterruptedException e) {
-                    context.connListener.displayMessage(e.getMessage());
-                    context.connListener.stageFailed(appName, 0, 0);
-                    return;
-                }
+                    context.connListener = connectionListener;
+                    context.videoCapabilities = videoDecoderRenderer.getCapabilities();
 
-                // Moonlight-core is not thread-safe with respect to connection start and stop, so
-                // we must not invoke that functionality in parallel.
-                synchronized (MoonBridge.class) {
-                    MoonBridge.setupBridge(videoDecoderRenderer, audioRenderer, connectionListener);
-                    int ret = MoonBridge.startConnection(context.serverAddress.address,
-                            context.serverAppVersion, context.serverGfeVersion, context.rtspSessionUrl,
-                            context.serverCodecModeSupport,
-                            context.negotiatedWidth, context.negotiatedHeight,
-                            context.streamConfig.getRefreshRate(), context.streamConfig.getBitrate(),
-                            context.negotiatedPacketSize, context.negotiatedRemoteStreaming,
-                            context.streamConfig.getAudioConfiguration().toInt(),
-                            context.streamConfig.getSupportedVideoFormats(),
-                            context.streamConfig.getClientRefreshRateX100(),
-                            context.riKey.getEncoded(), ib.array(),
-                            context.videoCapabilities,
-                            context.streamConfig.getColorSpace(),
-                            context.streamConfig.getColorRange());
-                    if (ret != 0) {
-                        // LiStartConnection() failed, so the caller is not expected
-                        // to stop the connection themselves. We need to release their
-                        // semaphore count for them.
-                        connectionAllowed.release();
+                    String appName = context.streamConfig.getApp().getAppName();
+
+                    context.connListener.stageStarting(appName);
+
+                    // Serialize the complete host launch and native connection sequence. The
+                    // protocol negotiation before MoonBridge.startConnection() also mutates the
+                    // host session, so it must not overlap another NvConnection instance.
+                    try {
+                        if (!acquireConnectionPermit()) {
+                            return;
+                        }
+                    } catch (InterruptedException e) {
+                        if (!isStopRequested()) {
+                            context.connListener.displayMessage(e.getMessage());
+                            context.connListener.stageFailed(appName, 0, 0);
+                        }
                         return;
+                    }
+
+                    try {
+                        if (!startApp()) {
+                            if (!isStopRequested()) {
+                                context.connListener.stageFailed(appName, 0, 0);
+                            }
+                            return;
+                        }
+                        if (isStopRequested()) {
+                            return;
+                        }
+                        context.connListener.stageComplete(appName);
+                    } catch (HostHttpResponseException e) {
+                        if (!isStopRequested()) {
+                            e.printStackTrace();
+                            context.connListener.displayMessage(e.getMessage());
+                            context.connListener.stageFailed(appName, 0, e.getErrorCode());
+                        }
+                        return;
+                    } catch (XmlPullParserException | IOException e) {
+                        if (!isStopRequested()) {
+                            e.printStackTrace();
+                            context.connListener.displayMessage(e.getMessage());
+                            context.connListener.stageFailed(appName, MoonBridge.ML_PORT_FLAG_TCP_47984 | MoonBridge.ML_PORT_FLAG_TCP_47989, 0);
+                        }
+                        return;
+                    }
+
+                    ByteBuffer ib = ByteBuffer.allocate(16);
+                    ib.putInt(context.riKeyId);
+
+                    // Moonlight-core is not thread-safe with respect to connection start and stop, so
+                    // we must not invoke that functionality in parallel.
+                    synchronized (MoonBridge.class) {
+                        if (isStopRequested()) {
+                            return;
+                        }
+
+                        MoonBridge.setupBridge(videoDecoderRenderer, audioRenderer, connectionListener);
+                        synchronized (lifecycleLock) {
+                            bridgeConfigured = true;
+                        }
+
+                        int ret = MoonBridge.startConnection(context.serverAddress.address,
+                                context.serverAppVersion, context.serverGfeVersion, context.rtspSessionUrl,
+                                context.serverCodecModeSupport,
+                                context.negotiatedWidth, context.negotiatedHeight,
+                                context.streamConfig.getRefreshRate(), context.streamConfig.getBitrate(),
+                                context.negotiatedPacketSize, context.negotiatedRemoteStreaming,
+                                context.streamConfig.getAudioConfiguration().toInt(),
+                                context.streamConfig.getSupportedVideoFormats(),
+                                context.streamConfig.getClientRefreshRateX100(),
+                                context.riKey.getEncoded(), ib.array(),
+                                context.videoCapabilities,
+                                context.streamConfig.getColorSpace(),
+                                context.streamConfig.getColorRange());
+                        if (ret != 0) {
+                            // LiStartConnection() failed, so the caller is not expected
+                            // to stop the connection themselves. Clean up the bridge and
+                            // release only the permit held by this connection instance.
+                            MoonBridge.cleanupBridge();
+                            synchronized (lifecycleLock) {
+                                bridgeConfigured = false;
+                            }
+                            return;
+                        }
+                    }
+                }
+                finally {
+                    boolean keepConnectionPermit;
+                    synchronized (lifecycleLock) {
+                        keepConnectionPermit = bridgeConfigured;
+                        if (startThread == Thread.currentThread()) {
+                            startThread = null;
+                        }
+                    }
+                    if (!keepConnectionPermit) {
+                        releaseConnectionPermit();
                     }
                 }
             }

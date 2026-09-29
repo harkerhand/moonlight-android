@@ -5,6 +5,7 @@ import android.content.Intent;
 import android.widget.Toast;
 
 import com.limelight.AppView;
+import com.limelight.AudioOnlyPlayerActivity;
 import com.limelight.Game;
 import com.limelight.R;
 import com.limelight.ShortcutTrampoline;
@@ -60,7 +61,7 @@ public class ServerHelper {
     public static Intent createStartIntent(Activity parent, NvApp app, ComputerDetails computer,
                                            ComputerManagerService.ComputerManagerBinder managerBinder,
                                            boolean audioOnly) {
-        Intent intent = new Intent(parent, Game.class);
+        Intent intent = new Intent(parent, audioOnly ? AudioOnlyPlayerActivity.class : Game.class);
         intent.putExtra(Game.EXTRA_HOST, computer.activeAddress.address);
         intent.putExtra(Game.EXTRA_PORT, computer.activeAddress.port);
         intent.putExtra(Game.EXTRA_HTTPS_PORT, computer.httpsPort);

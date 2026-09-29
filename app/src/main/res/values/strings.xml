@@ -93,6 +93,23 @@
     <string name="conn_terminated_msg">The connection was terminated.</string>
     <string name="error_code_prefix">Error code:</string>
 
+    <!-- Audio-only player -->
+    <string name="audio_only_player_title">Audio-only player</string>
+    <string name="audio_only_host">Host: %1$s</string>
+    <string name="audio_only_connecting">Connecting…</string>
+    <string name="audio_only_starting">Starting %1$s…</string>
+    <string name="audio_only_playing">Audio streaming</string>
+    <string name="audio_only_stopping">Stopping…</string>
+    <string name="audio_only_stopped">Stream stopped</string>
+    <string name="audio_only_error">Connection error: %1$s</string>
+    <string name="audio_only_audio_focus_failed">Another app is using audio</string>
+    <string name="audio_only_stop">Stop streaming</string>
+    <string name="audio_only_notification_channel">Audio streaming</string>
+    <string name="audio_only_notification_channel_description">Audio-only stream playback controls</string>
+    <string name="audio_only_notification_title">%1$s — Audio only</string>
+    <string name="audio_only_notification_connecting">Connecting to %1$s</string>
+    <string name="audio_only_notification_playing">Streaming from %1$s</string>
+
     <!-- General strings -->
     <string name="ip_hint">IP address of host PC</string>
     <string name="searching_pc">Searching for host PCs on your local network…\n\n

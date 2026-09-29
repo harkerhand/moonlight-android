@@ -26,11 +26,15 @@ Android 环境。
    `JmDNSDiscoveryAgent`，Android 14 及之后使用 `NsdManagerDiscoveryAgent`。
 4. `AppView` 展示选中主机的应用列表、缓存封面、运行状态，以及启动/退出
    操作。
-5. `Game` 负责全屏串流会话。它连接 Android 输入、虚拟手柄、音视频
+5. `Game` 负责普通全屏串流会话。它连接 Android 输入、虚拟手柄、音视频
    renderer、Wi-Fi lock、PiP 行为和 `NvConnection` 生命周期。
-6. `NvConnection` 与主机协商串流参数，校验配对状态，启动/停止应用，并进入
+6. `AudioOnlyPlayerActivity` 是仅音频播放器 UI；实际连接由前台
+   `AudioOnlyStreamService` 持有，因此页面退到后台、锁屏或从最近任务划走时
+   不会因 Activity 生命周期而停止。该模式不初始化输入或视频解码器，使用
+   `NoOpVideoRenderer` 丢弃 320x180、10 FPS、100 Kbps 的兼容视频流。
+7. `NvConnection` 与主机协商串流参数，校验配对状态，启动/停止应用，并进入
    native 串流桥接层。
-7. `MoonBridge` 加载 `libmoonlight-core.so`，并暴露 Java 到 native 的桥接
+8. `MoonBridge` 加载 `libmoonlight-core.so`，并暴露 Java 到 native 的桥接
    调用，用于串流、输入、音频、视频和连接状态。
 
 重要源码边界：
@@ -177,12 +181,16 @@ ProGuard/R8 配置：
 串流、配对、发现、手柄、USB 或 root-only 相关变更通常需要手动测试或设备
 测试。`connectedCheck` 需要已连接的 Android 设备或模拟器。
 
+仅音频后台模式还应在真机验证：连接后按 Home、锁屏、从最近任务划掉播放器，
+确认通知和音频继续；再通过通知或播放器的“停止串流”确认连接、MediaSession、
+Wi-Fi lock 和 partial wake lock 都被释放。
+
 ## 安全
 
 这个仓库中与安全相关的实现细节：
 
-- Manifest 请求网络、Wi-Fi 状态、wake lock、震动、键盘捕获、TV EPG 和
-  multicast 相关权限。
+- Manifest 请求网络、Wi-Fi 状态、wake lock、前台媒体服务、通知、震动、
+  键盘捕获、TV EPG 和 multicast 相关权限。
 - `network_security_config.xml` 全局允许 cleartext traffic，并信任系统 CA。
 - `NvHTTP` 使用 OkHttp、`Proxy.NO_PROXY`、显式 timeout、自定义
   `X509TrustManager`，以及允许已 pin 主机证书的 hostname verifier。

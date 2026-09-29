@@ -277,6 +277,22 @@
 \n注意：启用此选项可能会导致您的游戏手柄在主机上被识别为 PlayStation 4控制器。</string>
     <string name="title_checkbox_gamepad_motion_fallback">模拟游戏手柄运动传感器支持</string>
     <string name="error_code_prefix">错误代码:</string>
+    <!-- 仅音频播放器 -->
+    <string name="audio_only_player_title">仅音频播放器</string>
+    <string name="audio_only_host">主机：%1$s</string>
+    <string name="audio_only_connecting">正在连接…</string>
+    <string name="audio_only_starting">正在启动 %1$s…</string>
+    <string name="audio_only_playing">正在串流音频</string>
+    <string name="audio_only_stopping">正在停止…</string>
+    <string name="audio_only_stopped">串流已停止</string>
+    <string name="audio_only_error">连接错误：%1$s</string>
+    <string name="audio_only_audio_focus_failed">其他应用正在占用音频</string>
+    <string name="audio_only_stop">停止串流</string>
+    <string name="audio_only_notification_channel">音频串流</string>
+    <string name="audio_only_notification_channel_description">仅音频串流播放控制</string>
+    <string name="audio_only_notification_title">%1$s — 仅音频</string>
+    <string name="audio_only_notification_connecting">正在连接 %1$s</string>
+    <string name="audio_only_notification_playing">正在从 %1$s 串流</string>
     <string name="title_seekbar_vibrate_fallback_strength">调整模拟震动强度</string>
     <string name="suffix_seekbar_vibrate_fallback_strength">％</string>
     <string name="title_analog_scrolling">使用摇杆控制鼠标移动</string>

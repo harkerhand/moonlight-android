@@ -17,17 +17,31 @@ public class AndroidAudioRenderer implements AudioRenderer {
 
     private final Context context;
     private final boolean enableAudioFx;
+    private final int audioUsage;
+    private final int audioContentType;
+    private final int audioEffectContentType;
 
     private AudioTrack track;
+    private volatile float volume = 1.0f;
 
     public AndroidAudioRenderer(Context context, boolean enableAudioFx) {
+        this(context, enableAudioFx, AudioAttributes.USAGE_GAME,
+                AudioAttributes.CONTENT_TYPE_UNKNOWN, AudioEffect.CONTENT_TYPE_GAME);
+    }
+
+    public AndroidAudioRenderer(Context context, boolean enableAudioFx, int audioUsage,
+                                int audioContentType, int audioEffectContentType) {
         this.context = context;
         this.enableAudioFx = enableAudioFx;
+        this.audioUsage = audioUsage;
+        this.audioContentType = audioContentType;
+        this.audioEffectContentType = audioEffectContentType;
     }
 
     private AudioTrack createAudioTrack(int channelConfig, int sampleRate, int bufferSize, boolean lowLatency) {
         AudioAttributes.Builder attributesBuilder = new AudioAttributes.Builder()
-                .setUsage(AudioAttributes.USAGE_GAME);
+                .setUsage(audioUsage)
+                .setContentType(audioContentType);
         AudioFormat format = new AudioFormat.Builder()
                 .setEncoding(AudioFormat.ENCODING_PCM_16BIT)
                 .setSampleRate(sampleRate)
@@ -160,6 +174,7 @@ public class AndroidAudioRenderer implements AudioRenderer {
 
             try {
                 track = createAudioTrack(channelConfig, sampleRate, bufferSize, lowLatency);
+                track.setVolume(volume);
                 track.play();
 
                 // Successfully created working AudioTrack. We're done here.
@@ -199,6 +214,15 @@ public class AndroidAudioRenderer implements AudioRenderer {
         }
     }
 
+    public void setVolume(float volume) {
+        this.volume = volume;
+
+        AudioTrack currentTrack = track;
+        if (currentTrack != null) {
+            currentTrack.setVolume(volume);
+        }
+    }
+
     @Override
     public void start() {
         if (enableAudioFx) {
@@ -206,7 +230,7 @@ public class AndroidAudioRenderer implements AudioRenderer {
             Intent i = new Intent(AudioEffect.ACTION_OPEN_AUDIO_EFFECT_CONTROL_SESSION);
             i.putExtra(AudioEffect.EXTRA_AUDIO_SESSION, track.getAudioSessionId());
             i.putExtra(AudioEffect.EXTRA_PACKAGE_NAME, context.getPackageName());
-            i.putExtra(AudioEffect.EXTRA_CONTENT_TYPE, AudioEffect.CONTENT_TYPE_GAME);
+            i.putExtra(AudioEffect.EXTRA_CONTENT_TYPE, audioEffectContentType);
             context.sendBroadcast(i);
         }
     }
