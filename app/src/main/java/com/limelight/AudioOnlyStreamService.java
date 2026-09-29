@@ -53,17 +53,35 @@ public class AudioOnlyStreamService extends Service {
     public static final int STATE_STOPPING = 3;
     public static final int STATE_ERROR = 4;
 
-    private static final int AUDIO_ONLY_HORIZ_RES = 320;
-    private static final int AUDIO_ONLY_VERT_RES = 180;
-    private static final int AUDIO_ONLY_FPS = 10;
-    private static final int AUDIO_ONLY_BITRATE = 100;
-
     private static final int NOTIFICATION_ID = 1001;
     private static final String NOTIFICATION_CHANNEL_ID = "audio_only_stream";
     private static volatile boolean sessionActive;
 
     public interface StateListener {
         void onStateChanged(int state, String appName, String pcName, String detail);
+    }
+
+    public static final class PerformanceSnapshot {
+        public final int estimatedRttMs;
+        public final int rttVarianceMs;
+        public final int pendingAudioDurationMs;
+        public final float audioTrackWriteAverageMs;
+        public final float audioTrackWriteMaximumMs;
+        public final float videoReceivedFps;
+        public final float videoFrameLossPercentage;
+
+        private PerformanceSnapshot(int estimatedRttMs, int rttVarianceMs,
+                                    int pendingAudioDurationMs,
+                                    AndroidAudioRenderer.PerformanceSnapshot audioSnapshot,
+                                    NoOpVideoRenderer.PerformanceSnapshot videoSnapshot) {
+            this.estimatedRttMs = estimatedRttMs;
+            this.rttVarianceMs = rttVarianceMs;
+            this.pendingAudioDurationMs = pendingAudioDurationMs;
+            this.audioTrackWriteAverageMs = audioSnapshot.averageWriteTimeMs;
+            this.audioTrackWriteMaximumMs = audioSnapshot.maximumWriteTimeMs;
+            this.videoReceivedFps = videoSnapshot.receivedFps;
+            this.videoFrameLossPercentage = videoSnapshot.frameLossPercentage;
+        }
     }
 
     public final class LocalBinder extends Binder {
@@ -93,6 +111,16 @@ public class AudioOnlyStreamService extends Service {
         public void removeStateListener(StateListener listener) {
             stateListeners.remove(listener);
         }
+
+        public PerformanceSnapshot getPerformanceSnapshot() {
+            return AudioOnlyStreamService.this.getPerformanceSnapshot();
+        }
+
+        public boolean isPerformanceMetricsEnabled() {
+            synchronized (connectionLock) {
+                return performanceMetricsEnabled;
+            }
+        }
     }
 
     private final Object connectionLock = new Object();
@@ -112,6 +140,8 @@ public class AudioOnlyStreamService extends Service {
 
     private NvConnection connection;
     private AndroidAudioRenderer audioRenderer;
+    private NoOpVideoRenderer videoRenderer;
+    private boolean performanceMetricsEnabled;
     private long connectionGeneration;
     private String sessionKey;
     private int state = STATE_STOPPED;
@@ -199,6 +229,9 @@ public class AudioOnlyStreamService extends Service {
             generation = ++connectionGeneration;
             oldConnection = connection;
             connection = null;
+            audioRenderer = null;
+            videoRenderer = null;
+            performanceMetricsEnabled = false;
         }
 
         sessionKey = requestedSessionKey;
@@ -235,11 +268,12 @@ public class AudioOnlyStreamService extends Service {
                             startIntent.getBooleanExtra(Game.EXTRA_APP_HDR, false));
 
                     StreamConfiguration config = new StreamConfiguration.Builder()
-                            .setResolution(AUDIO_ONLY_HORIZ_RES, AUDIO_ONLY_VERT_RES)
-                            .setLaunchRefreshRate(AUDIO_ONLY_FPS)
-                            .setRefreshRate(AUDIO_ONLY_FPS)
+                            .setResolution(prefConfig.audioOnlyVideoWidth,
+                                    prefConfig.audioOnlyVideoHeight)
+                            .setLaunchRefreshRate(prefConfig.audioOnlyVideoFps)
+                            .setRefreshRate(prefConfig.audioOnlyVideoFps)
                             .setApp(app)
-                            .setBitrate(AUDIO_ONLY_BITRATE)
+                            .setBitrate(prefConfig.audioOnlyVideoBitrate)
                             .setEnableSops(false)
                             .enableLocalAudioPlayback(prefConfig.playHostAudio)
                             .setMaxPacketSize(1392)
@@ -276,18 +310,23 @@ public class AudioOnlyStreamService extends Service {
                             prefConfig.enableAudioFx,
                             AudioAttributes.USAGE_MEDIA,
                             AudioAttributes.CONTENT_TYPE_MUSIC,
-                            android.media.audiofx.AudioEffect.CONTENT_TYPE_MUSIC);
+                            android.media.audiofx.AudioEffect.CONTENT_TYPE_MUSIC,
+                            prefConfig.enablePerfOverlay);
+                    NoOpVideoRenderer newVideoRenderer = new NoOpVideoRenderer(
+                            prefConfig.enablePerfOverlay);
                     synchronized (connectionLock) {
                         if (generation != connectionGeneration) {
                             return;
                         }
                         newAudioRenderer.setVolume(playbackVolume);
                         audioRenderer = newAudioRenderer;
+                        videoRenderer = newVideoRenderer;
+                        performanceMetricsEnabled = prefConfig.enablePerfOverlay;
                     }
 
                     newConnection.start(
                             newAudioRenderer,
-                            new NoOpVideoRenderer(),
+                            newVideoRenderer,
                             new AudioConnectionListener(generation));
                 } catch (Exception e) {
                     LimeLog.severe("Unable to start audio-only stream: " + e);
@@ -321,6 +360,8 @@ public class AudioOnlyStreamService extends Service {
             connectionToStop = connection;
             connection = null;
             audioRenderer = null;
+            videoRenderer = null;
+            performanceMetricsEnabled = false;
         }
         sessionKey = null;
         setState(STATE_STOPPING, getString(R.string.audio_only_stopping));
@@ -366,6 +407,8 @@ public class AudioOnlyStreamService extends Service {
                     connectionToStop = connection;
                     connection = null;
                     audioRenderer = null;
+                    videoRenderer = null;
+                    performanceMetricsEnabled = false;
                 }
                 sessionKey = null;
                 sessionActive = false;
@@ -460,6 +503,33 @@ public class AudioOnlyStreamService extends Service {
                 audioRenderer.setVolume(volume);
             }
         }
+    }
+
+    private PerformanceSnapshot getPerformanceSnapshot() {
+        final AndroidAudioRenderer currentAudioRenderer;
+        final NoOpVideoRenderer currentVideoRenderer;
+        synchronized (connectionLock) {
+            if (state != STATE_PLAYING || !performanceMetricsEnabled ||
+                    audioRenderer == null || videoRenderer == null) {
+                return null;
+            }
+            currentAudioRenderer = audioRenderer;
+            currentVideoRenderer = videoRenderer;
+        }
+
+        AndroidAudioRenderer.PerformanceSnapshot audioSnapshot =
+                currentAudioRenderer.getPerformanceSnapshot();
+        NoOpVideoRenderer.PerformanceSnapshot videoSnapshot =
+                currentVideoRenderer.getPerformanceSnapshot();
+        if (audioSnapshot == null || videoSnapshot == null) {
+            return null;
+        }
+
+        long rttInfo = MoonBridge.getEstimatedRttInfo();
+        int estimatedRttMs = rttInfo == -1 ? -1 : (int) (rttInfo >> 32);
+        int rttVarianceMs = rttInfo == -1 ? -1 : (int) rttInfo;
+        return new PerformanceSnapshot(estimatedRttMs, rttVarianceMs,
+                MoonBridge.getPendingAudioDuration(), audioSnapshot, videoSnapshot);
     }
 
     private void setState(int newState, String detail) {
@@ -657,6 +727,8 @@ public class AudioOnlyStreamService extends Service {
             connectionToStop = connection;
             connection = null;
             audioRenderer = null;
+            videoRenderer = null;
+            performanceMetricsEnabled = false;
         }
         sessionActive = false;
         if (connectionToStop != null) {

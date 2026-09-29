@@ -31,7 +31,12 @@ Android 环境。
 6. `AudioOnlyPlayerActivity` 是仅音频播放器 UI；实际连接由前台
    `AudioOnlyStreamService` 持有，因此页面退到后台、锁屏或从最近任务划走时
    不会因 Activity 生命周期而停止。该模式不初始化输入或视频解码器，使用
-   `NoOpVideoRenderer` 丢弃 320x180、10 FPS、100 Kbps 的兼容视频流。
+   `NoOpVideoRenderer` 丢弃兼容视频流；其分辨率、帧率和码率可在“音频设置”
+   中独立配置，默认值为兼容优先的 320x180、10 FPS、100 Kbps；更低参数由
+   用户手动选择。
+   启用“显示性能统计”偏好后，播放器页面会在可见期间每秒通过本地 Binder
+   拉取 RTT、音频队列、AudioTrack 和兼容视频指标，并绘制最近 60 个样本；
+   页面进入后台后停止 UI 采样，不影响前台 Service 继续播放。
 7. `NvConnection` 与主机协商串流参数，校验配对状态，启动/停止应用，并进入
    native 串流桥接层。
 8. `MoonBridge` 加载 `libmoonlight-core.so`，并暴露 Java 到 native 的桥接

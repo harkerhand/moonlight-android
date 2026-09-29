@@ -10,12 +10,15 @@ import android.content.pm.PackageManager;
 import android.media.AudioManager;
 import android.os.Build;
 import android.os.Bundle;
+import android.os.Handler;
 import android.os.IBinder;
+import android.os.Looper;
 import android.view.View;
 import android.widget.Button;
 import android.widget.TextView;
 
 import com.limelight.nvstream.StreamConfiguration;
+import com.limelight.ui.AudioPerformanceGraphView;
 import com.limelight.utils.UiHelper;
 
 public class AudioOnlyPlayerActivity extends Activity implements AudioOnlyStreamService.StateListener {
@@ -27,10 +30,34 @@ public class AudioOnlyPlayerActivity extends Activity implements AudioOnlyStream
     private TextView pcNameView;
     private TextView statusView;
     private Button stopButton;
+    private View performancePanel;
+    private TextView performanceValuesView;
+    private AudioPerformanceGraphView performanceGraphView;
 
     private AudioOnlyStreamService.LocalBinder serviceBinder;
     private boolean serviceBound;
     private boolean serviceBinding;
+    private boolean activityVisible;
+    private boolean performanceSampleScheduled;
+    private boolean performanceBaselineReady;
+    private int currentState = AudioOnlyStreamService.STATE_STOPPED;
+    private final Handler performanceHandler = new Handler(Looper.getMainLooper());
+    private final Runnable performanceSampler = new Runnable() {
+        @Override
+        public void run() {
+            performanceSampleScheduled = false;
+            if (!shouldSamplePerformance()) {
+                return;
+            }
+
+            AudioOnlyStreamService.PerformanceSnapshot snapshot =
+                    serviceBinder.getPerformanceSnapshot();
+            if (snapshot != null) {
+                showPerformanceSnapshot(snapshot);
+            }
+            schedulePerformanceSample();
+        }
+    };
 
     private final ServiceConnection serviceConnection = new ServiceConnection() {
         @Override
@@ -38,12 +65,16 @@ public class AudioOnlyPlayerActivity extends Activity implements AudioOnlyStream
             serviceBinder = (AudioOnlyStreamService.LocalBinder) service;
             serviceBound = true;
             serviceBinder.addStateListener(AudioOnlyPlayerActivity.this);
+            updatePerformancePanel();
         }
 
         @Override
         public void onServiceDisconnected(ComponentName name) {
+            cancelPerformanceSampling();
             serviceBound = false;
             serviceBinder = null;
+            performancePanel.setVisibility(View.GONE);
+            performanceGraphView.clear();
             showState(AudioOnlyStreamService.STATE_STOPPED, null, null,
                     getString(R.string.audio_only_stopped));
         }
@@ -61,6 +92,9 @@ public class AudioOnlyPlayerActivity extends Activity implements AudioOnlyStream
         pcNameView = findViewById(R.id.audioOnlyPcName);
         statusView = findViewById(R.id.audioOnlyStatus);
         stopButton = findViewById(R.id.audioOnlyStopButton);
+        performancePanel = findViewById(R.id.audioOnlyPerformancePanel);
+        performanceValuesView = findViewById(R.id.audioOnlyPerformanceValues);
+        performanceGraphView = findViewById(R.id.audioOnlyPerformanceGraph);
         stopButton.setOnClickListener(new View.OnClickListener() {
             @Override
             public void onClick(View view) {
@@ -136,12 +170,17 @@ public class AudioOnlyPlayerActivity extends Activity implements AudioOnlyStream
     @Override
     protected void onStart() {
         super.onStart();
+        activityVisible = true;
         serviceBinding = bindService(new Intent(this, AudioOnlyStreamService.class),
                 serviceConnection, Context.BIND_AUTO_CREATE);
     }
 
     @Override
     protected void onStop() {
+        activityVisible = false;
+        cancelPerformanceSampling();
+        performanceGraphView.clear();
+        performanceValuesView.setText("");
         if (serviceBinding) {
             if (serviceBound) {
                 serviceBinder.removeStateListener(this);
@@ -164,7 +203,85 @@ public class AudioOnlyPlayerActivity extends Activity implements AudioOnlyStream
 
     @Override
     public void onStateChanged(int state, String appName, String pcName, String detail) {
+        currentState = state;
         showState(state, appName, pcName, detail);
+        updatePerformancePanel();
+    }
+
+    private void updatePerformancePanel() {
+        boolean enabled = serviceBound && serviceBinder != null &&
+                serviceBinder.isPerformanceMetricsEnabled();
+        boolean visible = enabled && currentState == AudioOnlyStreamService.STATE_PLAYING;
+        performancePanel.setVisibility(visible ? View.VISIBLE : View.GONE);
+        if (visible) {
+            schedulePerformanceSample();
+        }
+        else {
+            cancelPerformanceSampling();
+            performanceGraphView.clear();
+            performanceValuesView.setText("");
+        }
+    }
+
+    private boolean shouldSamplePerformance() {
+        return activityVisible && serviceBound && serviceBinder != null &&
+                currentState == AudioOnlyStreamService.STATE_PLAYING &&
+                serviceBinder.isPerformanceMetricsEnabled();
+    }
+
+    private void schedulePerformanceSample() {
+        if (!performanceSampleScheduled && shouldSamplePerformance()) {
+            if (!performanceBaselineReady) {
+                // Renderer statistics are windowed by snapshot reads. Discard the accumulated
+                // background interval so the first visible point represents the next second.
+                serviceBinder.getPerformanceSnapshot();
+                performanceBaselineReady = true;
+            }
+            performanceSampleScheduled = true;
+            performanceHandler.postDelayed(performanceSampler, 1000);
+        }
+    }
+
+    private void cancelPerformanceSampling() {
+        performanceHandler.removeCallbacks(performanceSampler);
+        performanceSampleScheduled = false;
+        performanceBaselineReady = false;
+    }
+
+    private void showPerformanceSnapshot(AudioOnlyStreamService.PerformanceSnapshot snapshot) {
+        StringBuilder values = new StringBuilder();
+        values.append(getString(R.string.audio_only_perf_network_rtt,
+                formatMilliseconds(snapshot.estimatedRttMs))).append('\n');
+        values.append(getString(R.string.audio_only_perf_rtt_variance,
+                formatMilliseconds(snapshot.rttVarianceMs))).append('\n');
+        values.append(getString(R.string.audio_only_perf_audio_decode_queue,
+                formatMilliseconds(snapshot.pendingAudioDurationMs))).append('\n');
+        values.append(getString(R.string.audio_only_perf_audio_track_write,
+                formatMilliseconds(snapshot.audioTrackWriteAverageMs),
+                formatMilliseconds(snapshot.audioTrackWriteMaximumMs))).append('\n');
+        values.append(getString(R.string.audio_only_perf_video_receive,
+                formatFps(snapshot.videoReceivedFps),
+                formatPercentage(snapshot.videoFrameLossPercentage)));
+        performanceValuesView.setText(values.toString());
+
+        performanceGraphView.addSample(
+                snapshot.estimatedRttMs >= 0 ? snapshot.estimatedRttMs : Float.NaN,
+                snapshot.pendingAudioDurationMs >= 0 ? snapshot.pendingAudioDurationMs : Float.NaN);
+    }
+
+    private String formatMilliseconds(float value) {
+        return Float.isNaN(value) || value < 0 ? getString(R.string.audio_only_perf_unavailable) :
+                getString(R.string.audio_only_perf_milliseconds, value);
+    }
+
+    private String formatFps(float value) {
+        return Float.isNaN(value) || value < 0 ? getString(R.string.audio_only_perf_unavailable) :
+                getString(R.string.audio_only_perf_fps, value);
+    }
+
+    private String formatPercentage(float value) {
+        return Float.isNaN(value) || value < 0 ? getString(R.string.audio_only_perf_unavailable) :
+                getString(R.string.audio_only_perf_percentage, value);
     }
 
     private void showState(int state, String appName, String pcName, String detail) {

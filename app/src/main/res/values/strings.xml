@@ -109,6 +109,19 @@
     <string name="audio_only_notification_title">%1$s — Audio only</string>
     <string name="audio_only_notification_connecting">Connecting to %1$s</string>
     <string name="audio_only_notification_playing">Streaming from %1$s</string>
+    <string name="audio_only_perf_title">Performance</string>
+    <string name="audio_only_perf_network_rtt">Network RTT: %1$s</string>
+    <string name="audio_only_perf_rtt_variance">RTT variance: %1$s</string>
+    <string name="audio_only_perf_audio_decode_queue">Audio decode queue: %1$s</string>
+    <string name="audio_only_perf_audio_track_write">AudioTrack write average / peak: %1$s / %2$s</string>
+    <string name="audio_only_perf_video_receive">Compatibility video receive: %1$s / loss %2$s</string>
+    <string name="audio_only_perf_legend_rtt">RTT</string>
+    <string name="audio_only_perf_legend_audio_queue">Audio queue</string>
+    <string name="audio_only_perf_graph_description">Recent 60-second performance graph</string>
+    <string name="audio_only_perf_unavailable">—</string>
+    <string name="audio_only_perf_milliseconds">%1$.1f ms</string>
+    <string name="audio_only_perf_fps">%1$.1f FPS</string>
+    <string name="audio_only_perf_percentage">%1$.1f%%</string>
 
     <!-- General strings -->
     <string name="ip_hint">IP address of host PC</string>
@@ -183,6 +196,18 @@
     <string name="category_audio_settings">Audio Settings</string>
     <string name="title_audio_config_list">Surround sound configuration</string>
     <string name="summary_audio_config_list">Enable 5.1 or 7.1 surround sound for home-theater systems</string>
+    <string name="title_audio_only_video_resolution">Audio-only video resolution</string>
+    <string name="summary_audio_only_video_resolution">Compatibility video resolution used during audio-only streaming. Very small resolutions may not work with every host encoder.</string>
+    <string name="title_audio_only_video_fps">Audio-only video frame rate</string>
+    <string name="summary_audio_only_video_fps">Compatibility video frame rate used during audio-only streaming. Sunshine may deliver frames above this target.</string>
+    <string name="title_audio_only_video_bitrate">Audio-only video bitrate</string>
+    <string name="summary_audio_only_video_bitrate">Requested compatibility video bitrate. Sunshine may adjust the actual encoder bitrate.</string>
+    <string name="suffix_audio_only_video_bitrate">Kbps</string>
+    <string name="audio_only_resolution_2x2">2 × 2 (Experimental)</string>
+    <string name="audio_only_resolution_16x16">16 × 16</string>
+    <string name="audio_only_resolution_32x18">32 × 18</string>
+    <string name="audio_only_resolution_160x90">160 × 90</string>
+    <string name="audio_only_resolution_320x180">320 × 180 (Compatible)</string>
     <string name="title_checkbox_enable_audiofx">Enable system equalizer support</string>
     <string name="summary_checkbox_enable_audiofx">Allows audio effects to function while streaming, but may increase audio latency</string>
 

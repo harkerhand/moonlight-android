@@ -49,6 +49,31 @@
             android:entries="@array/audio_config_names"
             android:entryValues="@array/audio_config_values"
             android:defaultValue="2" />
+        <ListPreference
+            android:key="list_audio_only_video_resolution"
+            android:title="@string/title_audio_only_video_resolution"
+            android:summary="@string/summary_audio_only_video_resolution"
+            android:entries="@array/audio_only_video_resolution_names"
+            android:entryValues="@array/audio_only_video_resolution_values"
+            android:defaultValue="320x180" />
+        <ListPreference
+            android:key="list_audio_only_video_fps"
+            android:title="@string/title_audio_only_video_fps"
+            android:summary="@string/summary_audio_only_video_fps"
+            android:entries="@array/audio_only_video_fps_names"
+            android:entryValues="@array/audio_only_video_fps_values"
+            android:defaultValue="10" />
+        <com.limelight.preferences.SeekBarPreference
+            android:key="seekbar_audio_only_video_bitrate_kbps"
+            android:dialogMessage="@string/summary_audio_only_video_bitrate"
+            seekbar:min="10"
+            android:max="1000"
+            seekbar:step="10"
+            seekbar:keyStep="10"
+            android:defaultValue="100"
+            android:summary="@string/summary_audio_only_video_bitrate"
+            android:text="@string/suffix_audio_only_video_bitrate"
+            android:title="@string/title_audio_only_video_bitrate" />
         <CheckBoxPreference
             android:key="checkbox_enable_audiofx"
             android:title="@string/title_checkbox_enable_audiofx"
