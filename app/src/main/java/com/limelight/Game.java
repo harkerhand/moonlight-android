@@ -247,18 +247,22 @@ public class Game extends Activity implements SurfaceHolder.Callback,
 
         // Listen for non-touch events on the game surface
         streamView = findViewById(R.id.surfaceView);
-        streamView.setOnGenericMotionListener(this);
-        streamView.setOnKeyListener(this);
-        streamView.setInputCallbacks(this);
+        if (!audioOnlyMode) {
+            streamView.setOnGenericMotionListener(this);
+            streamView.setOnKeyListener(this);
+            streamView.setInputCallbacks(this);
+        }
 
         // Listen for touch events on the background touch view to enable trackpad mode
         // to work on areas outside of the StreamView itself. We use a separate View
         // for this rather than just handling it at the Activity level, because that
         // allows proper touch splitting, which the OSC relies upon.
         View backgroundTouchView = findViewById(R.id.backgroundTouchView);
-        backgroundTouchView.setOnTouchListener(this);
+        if (!audioOnlyMode) {
+            backgroundTouchView.setOnTouchListener(this);
+        }
 
-        if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.R) {
+        if (!audioOnlyMode && Build.VERSION.SDK_INT >= Build.VERSION_CODES.R) {
             // Request unbuffered input event dispatching for all input classes we handle here.
             // Without this, input events are buffered to be delivered in lock-step with VBlank,
             // artificially increasing input latency while streaming.
@@ -282,9 +286,11 @@ public class Game extends Activity implements SurfaceHolder.Callback,
 
         performanceOverlayView = findViewById(R.id.performanceOverlay);
 
-        inputCaptureProvider = InputCaptureManager.getInputCaptureProvider(this, this);
+        if (!audioOnlyMode) {
+            inputCaptureProvider = InputCaptureManager.getInputCaptureProvider(this, this);
+        }
 
-        if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.O) {
+        if (!audioOnlyMode && Build.VERSION.SDK_INT >= Build.VERSION_CODES.O) {
             streamView.setOnCapturedPointerListener(new View.OnCapturedPointerListener() {
                 @Override
                 public boolean onCapturedPointer(View view, MotionEvent motionEvent) {
@@ -449,16 +455,19 @@ public class Game extends Activity implements SurfaceHolder.Callback,
             colorRange = decoderRenderer.getPreferredColorRange();
         }
 
-        int gamepadMask = ControllerHandler.getAttachedControllerMask(this);
-        if (!prefConfig.multiController) {
-            // Always set gamepad 1 present for when multi-controller is
-            // disabled for games that don't properly support detection
-            // of gamepads removed and replugged at runtime.
-            gamepadMask = 1;
-        }
-        if (prefConfig.onscreenController) {
-            // If we're using OSC, always set at least gamepad 1.
-            gamepadMask |= 1;
+        int gamepadMask = 0;
+        if (!audioOnlyMode) {
+            gamepadMask = ControllerHandler.getAttachedControllerMask(this);
+            if (!prefConfig.multiController) {
+                // Always set gamepad 1 present for when multi-controller is
+                // disabled for games that don't properly support detection
+                // of gamepads removed and replugged at runtime.
+                gamepadMask = 1;
+            }
+            if (prefConfig.onscreenController) {
+                // If we're using OSC, always set at least gamepad 1.
+                gamepadMask |= 1;
+            }
         }
 
         // Set to the optimal mode for streaming
@@ -513,25 +522,27 @@ public class Game extends Activity implements SurfaceHolder.Callback,
                 new ComputerDetails.AddressTuple(host, port),
                 httpsPort, uniqueId, config,
                 PlatformBinding.getCryptoProvider(this), serverCert);
-        controllerHandler = new ControllerHandler(this, conn, this, prefConfig);
-        keyboardTranslator = new KeyboardTranslator();
+        if (!audioOnlyMode) {
+            controllerHandler = new ControllerHandler(this, conn, this, prefConfig);
+            keyboardTranslator = new KeyboardTranslator();
 
-        InputManager inputManager = (InputManager) getSystemService(Context.INPUT_SERVICE);
-        inputManager.registerInputDeviceListener(keyboardTranslator, null);
+            InputManager inputManager = (InputManager) getSystemService(Context.INPUT_SERVICE);
+            inputManager.registerInputDeviceListener(keyboardTranslator, null);
 
-        // Initialize touch contexts
-        for (int i = 0; i < touchContextMap.length; i++) {
-            if (!prefConfig.touchscreenTrackpad) {
-                touchContextMap[i] = new AbsoluteTouchContext(conn, i, streamView);
-            }
-            else {
-                touchContextMap[i] = new RelativeTouchContext(conn, i,
-                        REFERENCE_HORIZ_RES, REFERENCE_VERT_RES,
-                        streamView, prefConfig);
+            // Initialize touch contexts
+            for (int i = 0; i < touchContextMap.length; i++) {
+                if (!prefConfig.touchscreenTrackpad) {
+                    touchContextMap[i] = new AbsoluteTouchContext(conn, i, streamView);
+                }
+                else {
+                    touchContextMap[i] = new RelativeTouchContext(conn, i,
+                            REFERENCE_HORIZ_RES, REFERENCE_VERT_RES,
+                            streamView, prefConfig);
+                }
             }
         }
 
-        if (prefConfig.onscreenController) {
+        if (!audioOnlyMode && prefConfig.onscreenController) {
             // create virtual onscreen controller
             virtualController = new VirtualController(controllerHandler,
                     (FrameLayout)streamView.getParent(),
@@ -540,7 +551,7 @@ public class Game extends Activity implements SurfaceHolder.Callback,
             virtualController.show();
         }
 
-        if (prefConfig.usbDriver) {
+        if (!audioOnlyMode && prefConfig.usbDriver) {
             // Start the USB driver
             bindService(new Intent(this, UsbDriverService.class),
                     usbDriverServiceConnection, Service.BIND_AUTO_CREATE);
@@ -626,7 +637,9 @@ public class Game extends Activity implements SurfaceHolder.Callback,
                 notificationOverlayView.setVisibility(View.GONE);
 
                 // Disable sensors while in PiP mode
-                controllerHandler.disableSensors();
+                if (controllerHandler != null) {
+                    controllerHandler.disableSensors();
+                }
 
                 // Update GameManager state to indicate we're in PiP (still gaming, but interruptible)
                 UiHelper.notifyStreamEnteringPiP(this);
@@ -647,7 +660,9 @@ public class Game extends Activity implements SurfaceHolder.Callback,
                 notificationOverlayView.setVisibility(requestedNotificationOverlayVisibility);
 
                 // Enable sensors again after exiting PiP
-                controllerHandler.enableSensors();
+                if (controllerHandler != null) {
+                    controllerHandler.enableSensors();
+                }
 
                 // Update GameManager state to indicate we're out of PiP (gaming, non-interruptible)
                 UiHelper.notifyStreamExitingPiP(this);
@@ -775,7 +790,9 @@ public class Game extends Activity implements SurfaceHolder.Callback,
 
         // With Android native pointer capture, capture is lost when focus is lost,
         // so it must be requested again when focus is regained.
-        inputCaptureProvider.onWindowFocusChanged(hasFocus);
+        if (inputCaptureProvider != null) {
+            inputCaptureProvider.onWindowFocusChanged(hasFocus);
+        }
     }
 
     private boolean isRefreshRateEqualMatch(float refreshRate) {
@@ -1088,7 +1105,9 @@ public class Game extends Activity implements SurfaceHolder.Callback,
         }
 
         // Destroy the capture provider
-        inputCaptureProvider.destroy();
+        if (inputCaptureProvider != null) {
+            inputCaptureProvider.destroy();
+        }
     }
 
     @Override
@@ -1100,7 +1119,9 @@ public class Game extends Activity implements SurfaceHolder.Callback,
             }
 
             // Ungrab input to prevent further input device notifications
-            setInputGrabState(false);
+            if (inputCaptureProvider != null) {
+                setInputGrabState(false);
+            }
         }
 
         super.onPause();
@@ -1179,6 +1200,10 @@ public class Game extends Activity implements SurfaceHolder.Callback,
     }
 
     private void setInputGrabState(boolean grab) {
+        if (inputCaptureProvider == null) {
+            return;
+        }
+
         // Grab/ungrab the mouse cursor
         if (grab) {
             inputCaptureProvider.enableCapture();
@@ -1357,6 +1382,10 @@ public class Game extends Activity implements SurfaceHolder.Callback,
 
     @Override
     public boolean handleKeyDown(KeyEvent event) {
+        if (audioOnlyMode) {
+            return false;
+        }
+
         // Pass-through virtual navigation keys
         if ((event.getFlags() & KeyEvent.FLAG_VIRTUAL_HARD_KEY) != 0) {
             return false;
@@ -1439,6 +1468,10 @@ public class Game extends Activity implements SurfaceHolder.Callback,
 
     @Override
     public boolean handleKeyUp(KeyEvent event) {
+        if (audioOnlyMode) {
+            return false;
+        }
+
         // Pass-through virtual navigation keys
         if ((event.getFlags() & KeyEvent.FLAG_VIRTUAL_HARD_KEY) != 0) {
             return false;
@@ -1502,6 +1535,10 @@ public class Game extends Activity implements SurfaceHolder.Callback,
     }
 
     private boolean handleKeyMultiple(KeyEvent event) {
+        if (audioOnlyMode) {
+            return false;
+        }
+
         // We can receive keys from a software keyboard that don't correspond to any existing
         // KEYCODE value. Android will give those to us as an ACTION_MULTIPLE KeyEvent.
         //
@@ -1814,6 +1851,10 @@ public class Game extends Activity implements SurfaceHolder.Callback,
     // Returns true if the event was consumed
     // NB: View is only present if called from a view callback
     private boolean handleMotionEvent(View view, MotionEvent event) {
+        if (audioOnlyMode) {
+            return false;
+        }
+
         // Pass through mouse/touch/joystick input if we're not grabbing
         if (!grabbedInput) {
             return false;
@@ -2230,6 +2271,10 @@ public class Game extends Activity implements SurfaceHolder.Callback,
     @SuppressLint("ClickableViewAccessibility")
     @Override
     public boolean onTouch(View view, MotionEvent event) {
+        if (audioOnlyMode) {
+            return false;
+        }
+
         if (event.getAction() == MotionEvent.ACTION_DOWN) {
             // Tell the OS not to buffer input events for us
             //
@@ -2261,7 +2306,9 @@ public class Game extends Activity implements SurfaceHolder.Callback,
             connecting = connected = false;
             updatePipAutoEnter();
 
-            controllerHandler.stop();
+            if (controllerHandler != null) {
+                controllerHandler.stop();
+            }
 
             // Update GameManager state to indicate we're no longer in game
             UiHelper.notifyStreamEnded(this);
@@ -2333,10 +2380,14 @@ public class Game extends Activity implements SurfaceHolder.Callback,
                 getWindow().clearFlags(WindowManager.LayoutParams.FLAG_KEEP_SCREEN_ON);
 
                 // Stop processing controller input
-                controllerHandler.stop();
+                if (controllerHandler != null) {
+                    controllerHandler.stop();
+                }
 
                 // Ungrab input
-                setInputGrabState(false);
+                if (inputCaptureProvider != null) {
+                    setInputGrabState(false);
+                }
 
                 if (!displayedFailureDialog) {
                     displayedFailureDialog = true;
@@ -2446,18 +2497,20 @@ public class Game extends Activity implements SurfaceHolder.Callback,
                 connecting = false;
                 updatePipAutoEnter();
 
-                // Hide the mouse cursor now after a short delay.
-                // Doing it before dismissing the spinner seems to be undone
-                // when the spinner gets displayed. On Android Q, even now
-                // is too early to capture. We will delay a second to allow
-                // the spinner to dismiss before capturing.
-                Handler h = new Handler();
-                h.postDelayed(new Runnable() {
-                    @Override
-                    public void run() {
-                        setInputGrabState(true);
-                    }
-                }, 500);
+                if (inputCaptureProvider != null) {
+                    // Hide the mouse cursor now after a short delay.
+                    // Doing it before dismissing the spinner seems to be undone
+                    // when the spinner gets displayed. On Android Q, even now
+                    // is too early to capture. We will delay a second to allow
+                    // the spinner to dismiss before capturing.
+                    Handler h = new Handler();
+                    h.postDelayed(new Runnable() {
+                        @Override
+                        public void run() {
+                            setInputGrabState(true);
+                        }
+                    }, 500);
+                }
 
                 // Keep the display on
                 getWindow().addFlags(WindowManager.LayoutParams.FLAG_KEEP_SCREEN_ON);
@@ -2505,6 +2558,10 @@ public class Game extends Activity implements SurfaceHolder.Callback,
 
     @Override
     public void rumble(short controllerNumber, short lowFreqMotor, short highFreqMotor) {
+        if (controllerHandler == null) {
+            return;
+        }
+
         LimeLog.info(String.format((Locale)null, "Rumble on gamepad %d: %04x %04x", controllerNumber, lowFreqMotor, highFreqMotor));
 
         controllerHandler.handleRumble(controllerNumber, lowFreqMotor, highFreqMotor);
@@ -2512,6 +2569,10 @@ public class Game extends Activity implements SurfaceHolder.Callback,
 
     @Override
     public void rumbleTriggers(short controllerNumber, short leftTrigger, short rightTrigger) {
+        if (controllerHandler == null) {
+            return;
+        }
+
         LimeLog.info(String.format((Locale)null, "Rumble on gamepad triggers %d: %04x %04x", controllerNumber, leftTrigger, rightTrigger));
 
         controllerHandler.handleRumbleTriggers(controllerNumber, leftTrigger, rightTrigger);
@@ -2527,12 +2588,16 @@ public class Game extends Activity implements SurfaceHolder.Callback,
 
     @Override
     public void setMotionEventState(short controllerNumber, byte motionType, short reportRateHz) {
-        controllerHandler.handleSetMotionEventState(controllerNumber, motionType, reportRateHz);
+        if (controllerHandler != null) {
+            controllerHandler.handleSetMotionEventState(controllerNumber, motionType, reportRateHz);
+        }
     }
 
     @Override
     public void setControllerLED(short controllerNumber, byte r, byte g, byte b) {
-        controllerHandler.handleSetControllerLED(controllerNumber, r, g, b);
+        if (controllerHandler != null) {
+            controllerHandler.handleSetControllerLED(controllerNumber, r, g, b);
+        }
     }
 
     @Override
@@ -2617,11 +2682,19 @@ public class Game extends Activity implements SurfaceHolder.Callback,
 
     @Override
     public void mouseMove(int deltaX, int deltaY) {
+        if (audioOnlyMode) {
+            return;
+        }
+
         conn.sendMouseMove((short) deltaX, (short) deltaY);
     }
 
     @Override
     public void mouseButtonEvent(int buttonId, boolean down) {
+        if (audioOnlyMode) {
+            return;
+        }
+
         byte buttonIndex;
 
         switch (buttonId)
@@ -2656,16 +2729,28 @@ public class Game extends Activity implements SurfaceHolder.Callback,
 
     @Override
     public void mouseVScroll(byte amount) {
+        if (audioOnlyMode) {
+            return;
+        }
+
         conn.sendMouseScroll(amount);
     }
 
     @Override
     public void mouseHScroll(byte amount) {
+        if (audioOnlyMode) {
+            return;
+        }
+
         conn.sendMouseHScroll(amount);
     }
 
     @Override
     public void keyboardEvent(boolean buttonDown, short keyCode) {
+        if (audioOnlyMode || keyboardTranslator == null) {
+            return;
+        }
+
         short keyMap = keyboardTranslator.translate(keyCode, -1);
         if (keyMap != 0) {
             // handleSpecialKeys() takes the Android keycode
@@ -2700,6 +2785,10 @@ public class Game extends Activity implements SurfaceHolder.Callback,
 
     @Override
     public void onPerfUpdate(final String text) {
+        if (audioOnlyMode) {
+            return;
+        }
+
         runOnUiThread(new Runnable() {
             @Override
             public void run() {
@@ -2724,6 +2813,10 @@ public class Game extends Activity implements SurfaceHolder.Callback,
 
     @Override
     public boolean onKey(View view, int keyCode, KeyEvent keyEvent) {
+        if (audioOnlyMode) {
+            return false;
+        }
+
         switch (keyEvent.getAction()) {
             case KeyEvent.ACTION_DOWN:
                 return handleKeyDown(keyEvent);
