@@ -4,6 +4,7 @@ import com.limelight.nvstream.av.video.VideoDecoderRenderer;
 import com.limelight.nvstream.jni.MoonBridge;
 
 public class NoOpVideoRenderer extends VideoDecoderRenderer {
+    private static final long VIDEO_STATS_WINDOW_NS = 1_000_000_000L;
     public static final class PerformanceSnapshot {
         public final float receivedFps;
         public final float frameLossPercentage;
@@ -20,6 +21,8 @@ public class NoOpVideoRenderer extends VideoDecoderRenderer {
     private int lastFrameNumber;
     private long framesReceived;
     private long framesLost;
+    private PerformanceSnapshot latestPerformanceSnapshot =
+            new PerformanceSnapshot(Float.NaN, Float.NaN);
 
     public NoOpVideoRenderer() {
         this(false);
@@ -44,6 +47,7 @@ public class NoOpVideoRenderer extends VideoDecoderRenderer {
             hasLastFrameNumber = false;
             framesReceived = 0;
             framesLost = 0;
+            latestPerformanceSnapshot = new PerformanceSnapshot(Float.NaN, Float.NaN);
         }
     }
 
@@ -87,6 +91,10 @@ public class NoOpVideoRenderer extends VideoDecoderRenderer {
 
         long nowNs = System.nanoTime();
         long elapsedNs = nowNs - measurementStartNs;
+        if (elapsedNs < VIDEO_STATS_WINDOW_NS) {
+            return latestPerformanceSnapshot;
+        }
+
         float receivedFps = framesReceived > 0 && elapsedNs > 0 ?
                 (float) (framesReceived * 1_000_000_000.0 / elapsedNs) : Float.NaN;
         long totalFrames = framesReceived + framesLost;
@@ -96,7 +104,8 @@ public class NoOpVideoRenderer extends VideoDecoderRenderer {
         framesReceived = 0;
         framesLost = 0;
 
-        return new PerformanceSnapshot(receivedFps, frameLossPercentage);
+        latestPerformanceSnapshot = new PerformanceSnapshot(receivedFps, frameLossPercentage);
+        return latestPerformanceSnapshot;
     }
 
     @Override

@@ -8,6 +8,8 @@ import android.app.PendingIntent;
 import android.app.Service;
 import android.content.Context;
 import android.content.Intent;
+import android.content.SharedPreferences;
+import android.content.pm.ServiceInfo;
 import android.media.AudioAttributes;
 import android.media.AudioFocusRequest;
 import android.media.AudioManager;
@@ -21,6 +23,8 @@ import android.os.Handler;
 import android.os.IBinder;
 import android.os.Looper;
 import android.os.PowerManager;
+import android.os.SystemClock;
+import android.util.Base64;
 
 import com.limelight.binding.PlatformBinding;
 import com.limelight.binding.audio.AndroidAudioRenderer;
@@ -39,22 +43,44 @@ import java.security.cert.CertificateException;
 import java.security.cert.CertificateFactory;
 import java.security.cert.X509Certificate;
 import java.util.HashSet;
+import java.util.Locale;
 import java.util.Set;
 import java.util.concurrent.ExecutorService;
 import java.util.concurrent.Executors;
+import java.util.concurrent.ScheduledExecutorService;
+import java.util.concurrent.ScheduledFuture;
+import java.util.concurrent.TimeUnit;
 
 public class AudioOnlyStreamService extends Service {
     public static final String ACTION_START = "com.limelight.action.START_AUDIO_ONLY_STREAM";
     public static final String ACTION_STOP = "com.limelight.action.STOP_AUDIO_ONLY_STREAM";
+    public static final String ACTION_RESTORE = "com.limelight.action.RESTORE_AUDIO_ONLY_STREAM";
 
     public static final int STATE_STOPPED = 0;
     public static final int STATE_CONNECTING = 1;
     public static final int STATE_PLAYING = 2;
     public static final int STATE_STOPPING = 3;
     public static final int STATE_ERROR = 4;
+    public static final int STATE_RECONNECTING = 5;
 
     private static final int NOTIFICATION_ID = 1001;
     private static final String NOTIFICATION_CHANNEL_ID = "audio_only_stream";
+    private static final String SESSION_PREFS = "AudioOnlySession";
+    private static final String SESSION_ACTIVE = "active";
+    private static final String SESSION_HOST = "host";
+    private static final String SESSION_PORT = "port";
+    private static final String SESSION_HTTPS_PORT = "httpsPort";
+    private static final String SESSION_APP_NAME = "appName";
+    private static final String SESSION_APP_ID = "appId";
+    private static final String SESSION_APP_HDR = "appHdr";
+    private static final String SESSION_UNIQUE_ID = "uniqueId";
+    private static final String SESSION_PC_UUID = "pcUuid";
+    private static final String SESSION_PC_NAME = "pcName";
+    private static final String SESSION_SERVER_CERT = "serverCert";
+    private static final int[] RECONNECT_DELAYS_MS = { 1000, 2000, 5000, 10000, 30000 };
+    private static final long TRACE_INTERVAL_MS = 200;
+    private static final long TRACE_HISTORY_DURATION_MS = 60_000;
+    private static final int TRACE_HISTORY_SIZE = 300;
     private static volatile boolean sessionActive;
 
     public interface StateListener {
@@ -69,11 +95,16 @@ public class AudioOnlyStreamService extends Service {
         public final float audioTrackWriteMaximumMs;
         public final float videoReceivedFps;
         public final float videoFrameLossPercentage;
+        public final long sequence;
+        public final long sampledAtMs;
 
-        private PerformanceSnapshot(int estimatedRttMs, int rttVarianceMs,
+        private PerformanceSnapshot(long sequence, long sampledAtMs,
+                                    int estimatedRttMs, int rttVarianceMs,
                                     int pendingAudioDurationMs,
                                     AndroidAudioRenderer.PerformanceSnapshot audioSnapshot,
                                     NoOpVideoRenderer.PerformanceSnapshot videoSnapshot) {
+            this.sequence = sequence;
+            this.sampledAtMs = sampledAtMs;
             this.estimatedRttMs = estimatedRttMs;
             this.rttVarianceMs = rttVarianceMs;
             this.pendingAudioDurationMs = pendingAudioDurationMs;
@@ -112,13 +143,17 @@ public class AudioOnlyStreamService extends Service {
             stateListeners.remove(listener);
         }
 
-        public PerformanceSnapshot getPerformanceSnapshot() {
-            return AudioOnlyStreamService.this.getPerformanceSnapshot();
+        public PerformanceSnapshot[] getPerformanceSnapshotsAfter(long sequence) {
+            return AudioOnlyStreamService.this.getPerformanceSnapshotsAfter(sequence);
         }
 
-        public boolean isPerformanceMetricsEnabled() {
+        public PerformanceSnapshot[] getPerformanceHistory() {
+            return AudioOnlyStreamService.this.getPerformanceHistory();
+        }
+
+        public boolean isPerformanceDisplayEnabled() {
             synchronized (connectionLock) {
-                return performanceMetricsEnabled;
+                return performanceDisplayEnabled;
             }
         }
     }
@@ -128,6 +163,16 @@ public class AudioOnlyStreamService extends Service {
     private final Set<StateListener> stateListeners = new HashSet<>();
     private final Handler mainHandler = new Handler(Looper.getMainLooper());
     private final ExecutorService connectionExecutor = Executors.newSingleThreadExecutor();
+    private final ScheduledExecutorService traceExecutor =
+            Executors.newSingleThreadScheduledExecutor();
+    private final Object traceLock = new Object();
+    private final PerformanceSnapshot[] traceHistory =
+            new PerformanceSnapshot[TRACE_HISTORY_SIZE];
+    private int traceNextIndex;
+    private int traceCount;
+    private long traceSequence;
+    private long traceSamplingGeneration;
+    private ScheduledFuture<?> traceFuture;
 
     private NotificationManager notificationManager;
     private MediaSession mediaSession;
@@ -141,17 +186,40 @@ public class AudioOnlyStreamService extends Service {
     private NvConnection connection;
     private AndroidAudioRenderer audioRenderer;
     private NoOpVideoRenderer videoRenderer;
-    private boolean performanceMetricsEnabled;
+    private boolean performanceDisplayEnabled;
     private long connectionGeneration;
     private String sessionKey;
-    private int state = STATE_STOPPED;
+    private volatile int state = STATE_STOPPED;
     private String appName;
     private String pcName;
     private String stateDetail;
     private float playbackVolume = 1.0f;
+    private Intent lastStartIntent;
+    private boolean sessionRequested;
+    private boolean reconnectScheduled;
+    private int reconnectAttempt;
+    private final Runnable reconnectRunnable = new Runnable() {
+        @Override
+        public void run() {
+            reconnectScheduled = false;
+            if (!sessionRequested || lastStartIntent == null) {
+                return;
+            }
+            startConnection(new Intent(lastStartIntent), true);
+        }
+    };
 
-    public static boolean isSessionActive() {
-        return sessionActive;
+    public static boolean isSessionActive(Context context) {
+        if (sessionActive) {
+            return true;
+        }
+        try {
+            return context.getSharedPreferences(SESSION_PREFS, MODE_PRIVATE)
+                    .getBoolean(SESSION_ACTIVE, false);
+        } catch (ClassCastException e) {
+            context.getSharedPreferences(SESSION_PREFS, MODE_PRIVATE).edit().clear().apply();
+            return false;
+        }
     }
 
     @Override
@@ -163,10 +231,12 @@ public class AudioOnlyStreamService extends Service {
         createNotificationChannel();
 
         mediaSession = new MediaSession(this, "MoonlightAudioOnly");
+        mediaSession.setFlags(MediaSession.FLAG_HANDLES_MEDIA_BUTTONS |
+                MediaSession.FLAG_HANDLES_TRANSPORT_CONTROLS);
         mediaSession.setCallback(new MediaSession.Callback() {
             @Override
             public void onStop() {
-                requestStop(true);
+                requestStop(true, true);
             }
         });
         mediaSession.setPlaybackToLocal(new AudioAttributes.Builder()
@@ -179,22 +249,60 @@ public class AudioOnlyStreamService extends Service {
 
     @Override
     public int onStartCommand(Intent intent, int flags, int startId) {
-        if (intent == null) {
+        if (intent != null && ACTION_START.equals(intent.getAction()) &&
+                (flags & START_FLAG_REDELIVERY) != 0 && !hasPersistedSession()) {
+            // An explicit stop may have cleared the persisted session just before the process
+            // was killed. Do not allow Android to resurrect that stale ACTION_START intent.
+            stopSelf(startId);
+            return START_NOT_STICKY;
+        }
+
+        Intent effectiveIntent = intent;
+        if (effectiveIntent == null || ACTION_RESTORE.equals(effectiveIntent.getAction())) {
+            effectiveIntent = restoreStartIntent();
+            if (effectiveIntent != null) {
+                LimeLog.info("Restoring persisted audio-only session");
+            }
+        }
+
+        if (effectiveIntent == null) {
             stopSelf(startId);
             return START_NOT_STICKY;
         }
 
         // The service enters the foreground before any connection setup or teardown work.
-        startForeground(NOTIFICATION_ID, buildNotification());
+        enterForeground();
 
-        if (ACTION_STOP.equals(intent.getAction())) {
-            requestStop(true);
+        if (ACTION_STOP.equals(effectiveIntent.getAction())) {
+            requestStop(true, true);
         }
-        else if (ACTION_START.equals(intent.getAction())) {
-            startConnection(new Intent(intent));
+        else if (ACTION_START.equals(effectiveIntent.getAction())) {
+            Intent startIntent = new Intent(effectiveIntent);
+            persistStartIntent(startIntent);
+            lastStartIntent = startIntent;
+            sessionRequested = true;
+            cancelReconnect();
+            reconnectAttempt = 0;
+            startConnection(startIntent, false);
+        }
+        else {
+            stopForeground(true);
+            stopSelf(startId);
+            return START_NOT_STICKY;
         }
 
-        return START_NOT_STICKY;
+        return START_REDELIVER_INTENT;
+    }
+
+    private void enterForeground() {
+        Notification notification = buildNotification();
+        if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.Q) {
+            startForeground(NOTIFICATION_ID, notification,
+                    ServiceInfo.FOREGROUND_SERVICE_TYPE_MEDIA_PLAYBACK);
+        }
+        else {
+            startForeground(NOTIFICATION_ID, notification);
+        }
     }
 
     @Override
@@ -202,11 +310,16 @@ public class AudioOnlyStreamService extends Service {
         return binder;
     }
 
-    private void startConnection(final Intent startIntent) {
+    private void startConnection(final Intent startIntent, boolean reconnecting) {
         final int appId = startIntent.getIntExtra(Game.EXTRA_APP_ID, StreamConfiguration.INVALID_APP_ID);
         final String host = startIntent.getStringExtra(Game.EXTRA_HOST);
         if (appId == StreamConfiguration.INVALID_APP_ID || host == null) {
+            clearPersistedSession();
+            sessionRequested = false;
+            sessionActive = false;
             setState(STATE_ERROR, getString(R.string.conn_error_msg));
+            stopForeground(true);
+            stopSelf();
             return;
         }
 
@@ -223,6 +336,11 @@ public class AudioOnlyStreamService extends Service {
             return;
         }
 
+        if (!requestedSessionKey.equals(sessionKey)) {
+            stopTraceSampling();
+            clearTraceHistory();
+        }
+
         final NvConnection oldConnection;
         final long generation;
         synchronized (connectionLock) {
@@ -231,7 +349,7 @@ public class AudioOnlyStreamService extends Service {
             connection = null;
             audioRenderer = null;
             videoRenderer = null;
-            performanceMetricsEnabled = false;
+            performanceDisplayEnabled = false;
         }
 
         sessionKey = requestedSessionKey;
@@ -239,15 +357,14 @@ public class AudioOnlyStreamService extends Service {
         appName = streamAppName;
         pcName = requestedPcName != null ? requestedPcName : host;
         acquireLocks();
-        setState(STATE_CONNECTING, getString(R.string.audio_only_connecting));
+        setState(STATE_CONNECTING, reconnecting ?
+                getString(R.string.audio_only_reconnecting_now) :
+                getString(R.string.audio_only_connecting));
         updateMediaMetadata();
 
         if (!requestAudioFocus()) {
-            sessionActive = false;
-            releaseSessionResources();
-            setState(STATE_ERROR, getString(R.string.audio_only_audio_focus_failed));
-            stopForeground(true);
-            stopSelf();
+            handleConnectionFailure(generation,
+                    getString(R.string.audio_only_audio_focus_failed));
             return;
         }
 
@@ -311,9 +428,8 @@ public class AudioOnlyStreamService extends Service {
                             AudioAttributes.USAGE_MEDIA,
                             AudioAttributes.CONTENT_TYPE_MUSIC,
                             android.media.audiofx.AudioEffect.CONTENT_TYPE_MUSIC,
-                            prefConfig.enablePerfOverlay);
-                    NoOpVideoRenderer newVideoRenderer = new NoOpVideoRenderer(
-                            prefConfig.enablePerfOverlay);
+                            true);
+                    NoOpVideoRenderer newVideoRenderer = new NoOpVideoRenderer(true);
                     synchronized (connectionLock) {
                         if (generation != connectionGeneration) {
                             return;
@@ -321,17 +437,21 @@ public class AudioOnlyStreamService extends Service {
                         newAudioRenderer.setVolume(playbackVolume);
                         audioRenderer = newAudioRenderer;
                         videoRenderer = newVideoRenderer;
-                        performanceMetricsEnabled = prefConfig.enablePerfOverlay;
+                        performanceDisplayEnabled = prefConfig.enablePerfOverlay;
                     }
 
                     newConnection.start(
                             newAudioRenderer,
                             newVideoRenderer,
                             new AudioConnectionListener(generation));
+                } catch (CertificateException | IllegalArgumentException e) {
+                    LimeLog.severe("Invalid audio-only session configuration: " + e);
+                    handleTerminalFailure(generation, e.getMessage() != null ?
+                            e.getMessage() : getString(R.string.conn_error_msg));
                 } catch (Exception e) {
                     LimeLog.severe("Unable to start audio-only stream: " + e);
-                    postConnectionError(generation, e.getMessage() != null ?
-                            e.getMessage() : getString(R.string.conn_error_msg), true);
+                    handleConnectionFailure(generation, e.getMessage() != null ?
+                            e.getMessage() : getString(R.string.conn_error_msg));
                 }
             }
         });
@@ -346,13 +466,101 @@ public class AudioOnlyStreamService extends Service {
                 .generateCertificate(new ByteArrayInputStream(certificateData));
     }
 
+    private void persistStartIntent(Intent intent) {
+        SharedPreferences.Editor editor = getSharedPreferences(SESSION_PREFS, MODE_PRIVATE)
+                .edit()
+                .clear()
+                .putBoolean(SESSION_ACTIVE, true)
+                .putString(SESSION_HOST, intent.getStringExtra(Game.EXTRA_HOST))
+                .putInt(SESSION_PORT, intent.getIntExtra(Game.EXTRA_PORT, NvHTTP.DEFAULT_HTTP_PORT))
+                .putInt(SESSION_HTTPS_PORT, intent.getIntExtra(Game.EXTRA_HTTPS_PORT, 0))
+                .putString(SESSION_APP_NAME, intent.getStringExtra(Game.EXTRA_APP_NAME))
+                .putInt(SESSION_APP_ID, intent.getIntExtra(Game.EXTRA_APP_ID,
+                        StreamConfiguration.INVALID_APP_ID))
+                .putBoolean(SESSION_APP_HDR, intent.getBooleanExtra(Game.EXTRA_APP_HDR, false))
+                .putString(SESSION_UNIQUE_ID, intent.getStringExtra(Game.EXTRA_UNIQUEID))
+                .putString(SESSION_PC_UUID, intent.getStringExtra(Game.EXTRA_PC_UUID))
+                .putString(SESSION_PC_NAME, intent.getStringExtra(Game.EXTRA_PC_NAME));
+
+        byte[] certificate = intent.getByteArrayExtra(Game.EXTRA_SERVER_CERT);
+        if (certificate != null) {
+            editor.putString(SESSION_SERVER_CERT, Base64.encodeToString(certificate, Base64.NO_WRAP));
+        }
+        if (!editor.commit()) {
+            LimeLog.warning("Failed to persist audio-only session recovery data");
+        }
+    }
+
+    private Intent restoreStartIntent() {
+        SharedPreferences preferences = getSharedPreferences(SESSION_PREFS, MODE_PRIVATE);
+        try {
+            if (!preferences.getBoolean(SESSION_ACTIVE, false)) {
+                return null;
+            }
+
+            String host = preferences.getString(SESSION_HOST, null);
+            int appId = preferences.getInt(SESSION_APP_ID, StreamConfiguration.INVALID_APP_ID);
+            if (host == null || appId == StreamConfiguration.INVALID_APP_ID) {
+                clearPersistedSession();
+                return null;
+            }
+
+            Intent intent = new Intent(this, AudioOnlyStreamService.class).setAction(ACTION_START);
+            intent.putExtra(Game.EXTRA_HOST, host);
+            intent.putExtra(Game.EXTRA_PORT,
+                    preferences.getInt(SESSION_PORT, NvHTTP.DEFAULT_HTTP_PORT));
+            intent.putExtra(Game.EXTRA_HTTPS_PORT, preferences.getInt(SESSION_HTTPS_PORT, 0));
+            intent.putExtra(Game.EXTRA_APP_NAME, preferences.getString(SESSION_APP_NAME, null));
+            intent.putExtra(Game.EXTRA_APP_ID, appId);
+            intent.putExtra(Game.EXTRA_APP_HDR, preferences.getBoolean(SESSION_APP_HDR, false));
+            intent.putExtra(Game.EXTRA_UNIQUEID, preferences.getString(SESSION_UNIQUE_ID, null));
+            intent.putExtra(Game.EXTRA_PC_UUID, preferences.getString(SESSION_PC_UUID, null));
+            intent.putExtra(Game.EXTRA_PC_NAME, preferences.getString(SESSION_PC_NAME, null));
+
+            String encodedCertificate = preferences.getString(SESSION_SERVER_CERT, null);
+            if (encodedCertificate != null) {
+                intent.putExtra(Game.EXTRA_SERVER_CERT,
+                        Base64.decode(encodedCertificate, Base64.DEFAULT));
+            }
+            return intent;
+        } catch (RuntimeException e) {
+            LimeLog.warning("Discarding invalid saved audio-only session: " + e);
+            clearPersistedSession();
+            return null;
+        }
+    }
+
+    private void clearPersistedSession() {
+        if (!getSharedPreferences(SESSION_PREFS, MODE_PRIVATE).edit().clear().commit()) {
+            LimeLog.warning("Failed to clear audio-only session recovery data");
+        }
+    }
+
+    private boolean hasPersistedSession() {
+        try {
+            return getSharedPreferences(SESSION_PREFS, MODE_PRIVATE)
+                    .getBoolean(SESSION_ACTIVE, false);
+        } catch (ClassCastException e) {
+            clearPersistedSession();
+            return false;
+        }
+    }
+
     private boolean isCurrentGeneration(long generation) {
         synchronized (connectionLock) {
             return generation == connectionGeneration;
         }
     }
 
-    private void requestStop(final boolean stopServiceWhenComplete) {
+    private void requestStop(final boolean stopServiceWhenComplete, boolean clearSession) {
+        sessionRequested = false;
+        cancelReconnect();
+        stopTraceSampling();
+        clearTraceHistory();
+        if (clearSession) {
+            clearPersistedSession();
+        }
+
         final NvConnection connectionToStop;
         final long generation;
         synchronized (connectionLock) {
@@ -361,7 +569,7 @@ public class AudioOnlyStreamService extends Service {
             connection = null;
             audioRenderer = null;
             videoRenderer = null;
-            performanceMetricsEnabled = false;
+            performanceDisplayEnabled = false;
         }
         sessionKey = null;
         setState(STATE_STOPPING, getString(R.string.audio_only_stopping));
@@ -392,14 +600,64 @@ public class AudioOnlyStreamService extends Service {
         });
     }
 
-    private void postConnectionError(final long generation, final String message,
-                                     final boolean cleanupConnection) {
+    private void handleConnectionFailure(final long generation, final String message) {
+        mainHandler.post(new Runnable() {
+            @Override
+            public void run() {
+                if (!isCurrentGeneration(generation) || !sessionRequested) {
+                    return;
+                }
+
+                final NvConnection connectionToStop;
+                final long stoppedGeneration;
+                synchronized (connectionLock) {
+                    stoppedGeneration = ++connectionGeneration;
+                    connectionToStop = connection;
+                    connection = null;
+                    audioRenderer = null;
+                    videoRenderer = null;
+                    performanceDisplayEnabled = false;
+                }
+                sessionActive = true;
+                stopTraceSampling();
+                clearTraceHistory();
+                setState(STATE_RECONNECTING, message);
+
+                connectionExecutor.execute(new Runnable() {
+                    @Override
+                    public void run() {
+                        if (connectionToStop != null) {
+                            connectionToStop.stop();
+                        }
+
+                        mainHandler.post(new Runnable() {
+                            @Override
+                            public void run() {
+                                if (isCurrentGeneration(stoppedGeneration) && sessionRequested) {
+                                    releaseSessionResources();
+                                    scheduleReconnect();
+                                }
+                            }
+                        });
+                    }
+                });
+            }
+        });
+    }
+
+    private void handleTerminalFailure(final long generation, final String message) {
         mainHandler.post(new Runnable() {
             @Override
             public void run() {
                 if (!isCurrentGeneration(generation)) {
                     return;
                 }
+
+                sessionRequested = false;
+                cancelReconnect();
+                stopTraceSampling();
+                clearTraceHistory();
+                clearPersistedSession();
 
                 final NvConnection connectionToStop;
                 synchronized (connectionLock) {
@@ -408,14 +666,14 @@ public class AudioOnlyStreamService extends Service {
                     connection = null;
                     audioRenderer = null;
                     videoRenderer = null;
-                    performanceMetricsEnabled = false;
+                    performanceDisplayEnabled = false;
                 }
                 sessionKey = null;
                 sessionActive = false;
                 releaseSessionResources();
                 setState(STATE_ERROR, message);
 
-                if (cleanupConnection && connectionToStop != null) {
+                if (connectionToStop != null) {
                     connectionExecutor.execute(new Runnable() {
                         @Override
                         public void run() {
@@ -428,6 +686,54 @@ public class AudioOnlyStreamService extends Service {
                 stopSelf();
             }
         });
+    }
+
+    private void scheduleReconnect() {
+        if (!sessionRequested || lastStartIntent == null || reconnectScheduled) {
+            return;
+        }
+
+        int delayIndex = Math.min(reconnectAttempt, RECONNECT_DELAYS_MS.length - 1);
+        int delayMs = RECONNECT_DELAYS_MS[delayIndex];
+        reconnectAttempt++;
+        reconnectScheduled = true;
+        LimeLog.warning("Audio-only session reconnect scheduled in " + delayMs + " ms");
+        setState(STATE_RECONNECTING,
+                getString(R.string.audio_only_reconnecting_delay, Math.max(1, delayMs / 1000)));
+        mainHandler.postDelayed(reconnectRunnable, delayMs);
+    }
+
+    private void cancelReconnect() {
+        mainHandler.removeCallbacks(reconnectRunnable);
+        reconnectScheduled = false;
+    }
+
+    private boolean isRetryableStageFailure(String stage, int errorCode, String message) {
+        if (errorCode == 400 || errorCode == 401 || errorCode == 403 || errorCode == 404 ||
+                errorCode == 470 || errorCode == 525 || errorCode == 599) {
+            return false;
+        }
+
+        String normalizedStage = stage == null ? "" : stage.toLowerCase(Locale.ROOT);
+        if (normalizedStage.equals("platform initialization") ||
+                normalizedStage.equals("audio stream initialization") ||
+                normalizedStage.equals("control stream initialization") ||
+                normalizedStage.equals("video stream initialization") ||
+                normalizedStage.equals("input stream initialization")) {
+            return false;
+        }
+
+        String normalizedMessage = message == null ? "" : message.toLowerCase(Locale.ROOT);
+        return !(normalizedMessage.contains("not paired") ||
+                normalizedMessage.contains("certificate mismatch") ||
+                normalizedMessage.contains("server version malformed") ||
+                normalizedMessage.contains("does not support") ||
+                normalizedMessage.contains("not in gfe app list") ||
+                normalizedMessage.contains("wasn't started by this device") ||
+                normalizedMessage.contains("application is minimized") ||
+                normalizedMessage.contains("failed to quit previous session") ||
+                normalizedMessage.contains("failed to launch application") ||
+                normalizedMessage.contains("failed to resume existing session"));
     }
 
     private final AudioManager.OnAudioFocusChangeListener audioFocusChangeListener =
@@ -445,7 +751,7 @@ public class AudioOnlyStreamService extends Service {
                             setRendererVolume(0.0f);
                             break;
                         case AudioManager.AUDIOFOCUS_LOSS:
-                            requestStop(true);
+                            requestStop(true, true);
                             break;
                         default:
                             break;
@@ -505,11 +811,11 @@ public class AudioOnlyStreamService extends Service {
         }
     }
 
-    private PerformanceSnapshot getPerformanceSnapshot() {
+    private PerformanceSnapshot capturePerformanceSnapshot() {
         final AndroidAudioRenderer currentAudioRenderer;
         final NoOpVideoRenderer currentVideoRenderer;
         synchronized (connectionLock) {
-            if (state != STATE_PLAYING || !performanceMetricsEnabled ||
+            if (state != STATE_PLAYING ||
                     audioRenderer == null || videoRenderer == null) {
                 return null;
             }
@@ -528,8 +834,119 @@ public class AudioOnlyStreamService extends Service {
         long rttInfo = MoonBridge.getEstimatedRttInfo();
         int estimatedRttMs = rttInfo == -1 ? -1 : (int) (rttInfo >> 32);
         int rttVarianceMs = rttInfo == -1 ? -1 : (int) rttInfo;
-        return new PerformanceSnapshot(estimatedRttMs, rttVarianceMs,
+        long sequence;
+        synchronized (traceLock) {
+            sequence = ++traceSequence;
+        }
+        return new PerformanceSnapshot(sequence, SystemClock.elapsedRealtime(),
+                estimatedRttMs, rttVarianceMs,
                 MoonBridge.getPendingAudioDuration(), audioSnapshot, videoSnapshot);
+    }
+
+    private PerformanceSnapshot[] getPerformanceSnapshotsAfter(long sequence) {
+        synchronized (traceLock) {
+            pruneTraceHistoryLocked(SystemClock.elapsedRealtime() - TRACE_HISTORY_DURATION_MS);
+            if (traceCount == 0) {
+                return new PerformanceSnapshot[0];
+            }
+
+            int oldestIndex = (traceNextIndex - traceCount + TRACE_HISTORY_SIZE) %
+                    TRACE_HISTORY_SIZE;
+            int matchingCount = 0;
+            for (int i = 0; i < traceCount; i++) {
+                PerformanceSnapshot snapshot =
+                        traceHistory[(oldestIndex + i) % TRACE_HISTORY_SIZE];
+                if (snapshot.sequence > sequence) {
+                    matchingCount++;
+                }
+            }
+
+            PerformanceSnapshot[] snapshots = new PerformanceSnapshot[matchingCount];
+            int outputIndex = 0;
+            for (int i = 0; i < traceCount; i++) {
+                PerformanceSnapshot snapshot =
+                        traceHistory[(oldestIndex + i) % TRACE_HISTORY_SIZE];
+                if (snapshot.sequence > sequence) {
+                    snapshots[outputIndex++] = snapshot;
+                }
+            }
+            return snapshots;
+        }
+    }
+
+    private PerformanceSnapshot[] getPerformanceHistory() {
+        synchronized (traceLock) {
+            pruneTraceHistoryLocked(SystemClock.elapsedRealtime() - TRACE_HISTORY_DURATION_MS);
+            PerformanceSnapshot[] snapshots = new PerformanceSnapshot[traceCount];
+            int oldestIndex = (traceNextIndex - traceCount + TRACE_HISTORY_SIZE) %
+                    TRACE_HISTORY_SIZE;
+            for (int i = 0; i < traceCount; i++) {
+                snapshots[i] = traceHistory[(oldestIndex + i) % TRACE_HISTORY_SIZE];
+            }
+            return snapshots;
+        }
+    }
+
+    private synchronized void startTraceSampling() {
+        if (traceFuture != null && !traceFuture.isDone()) {
+            return;
+        }
+
+        final long generation = ++traceSamplingGeneration;
+        traceFuture = traceExecutor.scheduleAtFixedRate(new Runnable() {
+            @Override
+            public void run() {
+                try {
+                    PerformanceSnapshot snapshot = capturePerformanceSnapshot();
+                    if (snapshot == null) {
+                        return;
+                    }
+
+                    synchronized (traceLock) {
+                        if (generation != traceSamplingGeneration) {
+                            return;
+                        }
+                        pruneTraceHistoryLocked(snapshot.sampledAtMs - TRACE_HISTORY_DURATION_MS);
+                        traceHistory[traceNextIndex] = snapshot;
+                        traceNextIndex = (traceNextIndex + 1) % TRACE_HISTORY_SIZE;
+                        traceCount = Math.min(traceCount + 1, TRACE_HISTORY_SIZE);
+                    }
+                } catch (RuntimeException e) {
+                    LimeLog.warning("Audio-only trace sample failed: " + e);
+                }
+            }
+        }, 0, TRACE_INTERVAL_MS, TimeUnit.MILLISECONDS);
+    }
+
+    private synchronized void stopTraceSampling() {
+        traceSamplingGeneration++;
+        if (traceFuture != null) {
+            traceFuture.cancel(false);
+            traceFuture = null;
+        }
+    }
+
+    private void clearTraceHistory() {
+        synchronized (traceLock) {
+            for (int i = 0; i < traceHistory.length; i++) {
+                traceHistory[i] = null;
+            }
+            traceNextIndex = 0;
+            traceCount = 0;
+        }
+    }
+
+    private void pruneTraceHistoryLocked(long cutoffMs) {
+        while (traceCount > 0) {
+            int oldestIndex = (traceNextIndex - traceCount + TRACE_HISTORY_SIZE) %
+                    TRACE_HISTORY_SIZE;
+            PerformanceSnapshot oldest = traceHistory[oldestIndex];
+            if (oldest != null && oldest.sampledAtMs >= cutoffMs) {
+                break;
+            }
+            traceHistory[oldestIndex] = null;
+            traceCount--;
+        }
     }
 
     private void setState(int newState, String detail) {
@@ -562,6 +979,7 @@ public class AudioOnlyStreamService extends Service {
         int playbackState;
         switch (state) {
             case STATE_CONNECTING:
+            case STATE_RECONNECTING:
                 playbackState = PlaybackState.STATE_CONNECTING;
                 break;
             case STATE_PLAYING:
@@ -630,6 +1048,10 @@ public class AudioOnlyStreamService extends Service {
                         .setMediaSession(mediaSession.getSessionToken())
                         .setShowActionsInCompactView(0));
 
+        if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.S) {
+            builder.setForegroundServiceBehavior(Notification.FOREGROUND_SERVICE_IMMEDIATE);
+        }
+
         return builder.build();
     }
 
@@ -638,6 +1060,9 @@ public class AudioOnlyStreamService extends Service {
             case STATE_CONNECTING:
                 return getString(R.string.audio_only_notification_connecting,
                         pcName != null ? pcName : "");
+            case STATE_RECONNECTING:
+                return stateDetail != null ? stateDetail :
+                        getString(R.string.audio_only_reconnecting_now);
             case STATE_PLAYING:
                 return getString(R.string.audio_only_notification_playing,
                         pcName != null ? pcName : "");
@@ -721,6 +1146,8 @@ public class AudioOnlyStreamService extends Service {
 
     @Override
     public void onDestroy() {
+        cancelReconnect();
+        stopTraceSampling();
         final NvConnection connectionToStop;
         synchronized (connectionLock) {
             ++connectionGeneration;
@@ -728,7 +1155,7 @@ public class AudioOnlyStreamService extends Service {
             connection = null;
             audioRenderer = null;
             videoRenderer = null;
-            performanceMetricsEnabled = false;
+            performanceDisplayEnabled = false;
         }
         sessionActive = false;
         if (connectionToStop != null) {
@@ -740,6 +1167,7 @@ public class AudioOnlyStreamService extends Service {
             });
         }
         connectionExecutor.shutdown();
+        traceExecutor.shutdownNow();
         releaseSessionResources();
         stateListeners.clear();
         if (mediaSession != null) {
@@ -751,6 +1179,7 @@ public class AudioOnlyStreamService extends Service {
 
     private final class AudioConnectionListener implements NvConnectionListener {
         private final long generation;
+        private String failureMessage;
 
         private AudioConnectionListener(long generation) {
             this.generation = generation;
@@ -774,13 +1203,19 @@ public class AudioOnlyStreamService extends Service {
 
         @Override
         public void stageFailed(String stage, int portFlags, int errorCode) {
-            String message = getString(R.string.conn_error_msg) + " " + stage +
-                    " (error " + errorCode + ")";
+            String message = failureMessage != null ? failureMessage :
+                    getString(R.string.conn_error_msg) + " " + stage +
+                            " (error " + errorCode + ")";
             if (portFlags != 0) {
                 message += "\n" + getString(R.string.check_ports_msg) + "\n" +
                         MoonBridge.stringifyPortFlags(portFlags, "\n");
             }
-            postConnectionError(generation, message, false);
+            if (isRetryableStageFailure(stage, errorCode, message)) {
+                handleConnectionFailure(generation, message);
+            }
+            else {
+                handleTerminalFailure(generation, message);
+            }
         }
 
         @Override
@@ -789,7 +1224,11 @@ public class AudioOnlyStreamService extends Service {
                 @Override
                 public void run() {
                     if (isCurrentGeneration(generation)) {
+                        cancelReconnect();
+                        reconnectAttempt = 0;
+                        LimeLog.info("Audio-only session connected");
                         setState(STATE_PLAYING, getString(R.string.audio_only_playing));
+                        startTraceSampling();
                     }
                 }
             });
@@ -802,7 +1241,7 @@ public class AudioOnlyStreamService extends Service {
                     @Override
                     public void run() {
                         if (isCurrentGeneration(generation)) {
-                            requestStop(true);
+                            requestStop(true, true);
                         }
                     }
                 });
@@ -813,7 +1252,13 @@ public class AudioOnlyStreamService extends Service {
                     Integer.toHexString(errorCode) : Integer.toString(errorCode);
             String message = getString(R.string.conn_terminated_msg) + " " +
                     getString(R.string.error_code_prefix) + " " + errorCodeString;
-            postConnectionError(generation, message, true);
+            if (errorCode == MoonBridge.ML_ERROR_PROTECTED_CONTENT ||
+                    errorCode == MoonBridge.ML_ERROR_FRAME_CONVERSION) {
+                handleTerminalFailure(generation, message);
+            }
+            else {
+                handleConnectionFailure(generation, message);
+            }
         }
 
         @Override
@@ -836,7 +1281,7 @@ public class AudioOnlyStreamService extends Service {
 
         @Override
         public void displayMessage(String message) {
-            postConnectionError(generation, message, false);
+            failureMessage = message;
         }
 
         @Override

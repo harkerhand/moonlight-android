@@ -34,9 +34,12 @@ Android 环境。
    `NoOpVideoRenderer` 丢弃兼容视频流；其分辨率、帧率和码率可在“音频设置”
    中独立配置，默认值为兼容优先的 320x180、10 FPS、100 Kbps；更低参数由
    用户手动选择。
-   启用“显示性能统计”偏好后，播放器页面会在可见期间每秒通过本地 Binder
-   拉取 RTT、音频队列、AudioTrack 和兼容视频指标，并绘制最近 60 个样本；
-   页面进入后台后停止 UI 采样，不影响前台 Service 继续播放。
+   Service 在整个播放期间以 200 ms 粒度持续采集 RTT、音频队列、AudioTrack
+   和兼容视频指标，并保存最近 60 秒的 300 个样本；“显示性能统计”偏好只控制
+   播放器页面是否读取并绘制历史，不影响后台 trace 采集。
+   Service 使用 `START_REDELIVER_INTENT` 并在应用私有 SharedPreferences 中保存
+   当前会话参数；进程被系统回收后可恢复。非正常断线会保持前台通知并按退避
+   间隔自动重连，只有显式停止或主机正常结束会话才清除恢复状态。
 7. `NvConnection` 与主机协商串流参数，校验配对状态，启动/停止应用，并进入
    native 串流桥接层。
 8. `MoonBridge` 加载 `libmoonlight-core.so`，并暴露 Java 到 native 的桥接
@@ -218,6 +221,8 @@ Wi-Fi lock 和 partial wake lock 都被释放。
   `BuildConfig.DEBUG` 让 `NvHTTP` 进入 verbose 模式。
 - 将 `client.key`、`client.crt`、`uniqueid`、主机地址和持久化的服务端证书
   视为私有 app 数据。
+- `AudioOnlySession` 私有 SharedPreferences 保存后台恢复所需的主机、应用、
+  unique ID 和服务端证书；显式停止时必须清除，且继续保持在备份排除范围内。
 - root-only 输入捕获和 evdev-reader 行为应保持在 `root` flavor 后面。
 - 如果新增 SharedPreferences 或持久化设备/主机相关数据，需要复核备份规则。
 

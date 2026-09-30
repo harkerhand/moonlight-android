@@ -97,6 +97,8 @@
     <string name="audio_only_player_title">Audio-only player</string>
     <string name="audio_only_host">Host: %1$s</string>
     <string name="audio_only_connecting">Connecting…</string>
+    <string name="audio_only_reconnecting_now">Reconnecting…</string>
+    <string name="audio_only_reconnecting_delay">Connection lost. Reconnecting in %1$d seconds…</string>
     <string name="audio_only_starting">Starting %1$s…</string>
     <string name="audio_only_playing">Audio streaming</string>
     <string name="audio_only_stopping">Stopping…</string>

@@ -12,7 +12,7 @@ import java.util.Arrays;
 import java.util.Locale;
 
 public class AudioPerformanceGraphView extends View {
-    private static final int SAMPLE_COUNT = 60;
+    private static final int SAMPLE_COUNT = 300;
     private static final float MINIMUM_Y_MAX_MS = 50.0f;
     private static final int GRID_LINE_COUNT = 4;
 

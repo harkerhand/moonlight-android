@@ -39,7 +39,9 @@ public class AudioOnlyPlayerActivity extends Activity implements AudioOnlyStream
     private boolean serviceBinding;
     private boolean activityVisible;
     private boolean performanceSampleScheduled;
-    private boolean performanceBaselineReady;
+    private boolean performanceHistoryLoaded;
+    private long lastPerformanceSequence = -1;
+    private long lastPerformanceValuesUpdateMs = -1;
     private int currentState = AudioOnlyStreamService.STATE_STOPPED;
     private final Handler performanceHandler = new Handler(Looper.getMainLooper());
     private final Runnable performanceSampler = new Runnable() {
@@ -50,9 +52,9 @@ public class AudioOnlyPlayerActivity extends Activity implements AudioOnlyStream
                 return;
             }
 
-            AudioOnlyStreamService.PerformanceSnapshot snapshot =
-                    serviceBinder.getPerformanceSnapshot();
-            if (snapshot != null) {
+            AudioOnlyStreamService.PerformanceSnapshot[] snapshots =
+                    serviceBinder.getPerformanceSnapshotsAfter(lastPerformanceSequence);
+            for (AudioOnlyStreamService.PerformanceSnapshot snapshot : snapshots) {
                 showPerformanceSnapshot(snapshot);
             }
             schedulePerformanceSample();
@@ -75,6 +77,10 @@ public class AudioOnlyPlayerActivity extends Activity implements AudioOnlyStream
             serviceBinder = null;
             performancePanel.setVisibility(View.GONE);
             performanceGraphView.clear();
+            performanceValuesView.setText("");
+            performanceHistoryLoaded = false;
+            lastPerformanceSequence = -1;
+            lastPerformanceValuesUpdateMs = -1;
             showState(AudioOnlyStreamService.STATE_STOPPED, null, null,
                     getString(R.string.audio_only_stopped));
         }
@@ -101,7 +107,6 @@ public class AudioOnlyPlayerActivity extends Activity implements AudioOnlyStream
                 stopAudioStream();
             }
         });
-
         showLaunchDetails(getIntent());
         startAudioStreamIfRequested(getIntent());
         requestNotificationPermission();
@@ -139,8 +144,12 @@ public class AudioOnlyPlayerActivity extends Activity implements AudioOnlyStream
         if (!sourceIntent.hasExtra(Game.EXTRA_APP_ID) ||
                 sourceIntent.getIntExtra(Game.EXTRA_APP_ID,
                         StreamConfiguration.INVALID_APP_ID) == StreamConfiguration.INVALID_APP_ID) {
-            // Notification launches intentionally contain no stream parameters, so opening the
-            // player never starts a duplicate connection.
+            // Notification and task restoration launches intentionally contain no stream
+            // parameters. Ask the Service to restore a persisted session if one exists.
+            if (AudioOnlyStreamService.isSessionActive(this)) {
+                startAudioStreamService(new Intent(this, AudioOnlyStreamService.class)
+                        .setAction(AudioOnlyStreamService.ACTION_RESTORE));
+            }
             return;
         }
 
@@ -150,6 +159,10 @@ public class AudioOnlyPlayerActivity extends Activity implements AudioOnlyStream
             serviceIntent.putExtras(sourceIntent.getExtras());
         }
 
+        startAudioStreamService(serviceIntent);
+    }
+
+    private void startAudioStreamService(Intent serviceIntent) {
         if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.O) {
             startForegroundService(serviceIntent);
         }
@@ -181,6 +194,9 @@ public class AudioOnlyPlayerActivity extends Activity implements AudioOnlyStream
         cancelPerformanceSampling();
         performanceGraphView.clear();
         performanceValuesView.setText("");
+        performanceHistoryLoaded = false;
+        lastPerformanceSequence = -1;
+        lastPerformanceValuesUpdateMs = -1;
         if (serviceBinding) {
             if (serviceBound) {
                 serviceBinder.removeStateListener(this);
@@ -210,7 +226,7 @@ public class AudioOnlyPlayerActivity extends Activity implements AudioOnlyStream
 
     private void updatePerformancePanel() {
         boolean enabled = serviceBound && serviceBinder != null &&
-                serviceBinder.isPerformanceMetricsEnabled();
+                serviceBinder.isPerformanceDisplayEnabled();
         boolean visible = enabled && currentState == AudioOnlyStreamService.STATE_PLAYING;
         performancePanel.setVisibility(visible ? View.VISIBLE : View.GONE);
         if (visible) {
@@ -220,35 +236,60 @@ public class AudioOnlyPlayerActivity extends Activity implements AudioOnlyStream
             cancelPerformanceSampling();
             performanceGraphView.clear();
             performanceValuesView.setText("");
+            performanceHistoryLoaded = false;
+            lastPerformanceSequence = -1;
+            lastPerformanceValuesUpdateMs = -1;
         }
     }
 
     private boolean shouldSamplePerformance() {
         return activityVisible && serviceBound && serviceBinder != null &&
                 currentState == AudioOnlyStreamService.STATE_PLAYING &&
-                serviceBinder.isPerformanceMetricsEnabled();
+                serviceBinder.isPerformanceDisplayEnabled();
     }
 
     private void schedulePerformanceSample() {
         if (!performanceSampleScheduled && shouldSamplePerformance()) {
-            if (!performanceBaselineReady) {
-                // Renderer statistics are windowed by snapshot reads. Discard the accumulated
-                // background interval so the first visible point represents the next second.
-                serviceBinder.getPerformanceSnapshot();
-                performanceBaselineReady = true;
+            if (!performanceHistoryLoaded) {
+                loadPerformanceHistory();
             }
             performanceSampleScheduled = true;
-            performanceHandler.postDelayed(performanceSampler, 1000);
+            performanceHandler.postDelayed(performanceSampler, 200);
         }
     }
 
     private void cancelPerformanceSampling() {
         performanceHandler.removeCallbacks(performanceSampler);
         performanceSampleScheduled = false;
-        performanceBaselineReady = false;
+    }
+
+    private void loadPerformanceHistory() {
+        performanceGraphView.clear();
+        AudioOnlyStreamService.PerformanceSnapshot[] history =
+                serviceBinder.getPerformanceHistory();
+        for (AudioOnlyStreamService.PerformanceSnapshot snapshot : history) {
+            addPerformanceGraphSample(snapshot);
+            lastPerformanceSequence = snapshot.sequence;
+        }
+        if (history.length > 0) {
+            AudioOnlyStreamService.PerformanceSnapshot latest = history[history.length - 1];
+            showPerformanceValues(latest);
+            lastPerformanceValuesUpdateMs = latest.sampledAtMs;
+        }
+        performanceHistoryLoaded = true;
     }
 
     private void showPerformanceSnapshot(AudioOnlyStreamService.PerformanceSnapshot snapshot) {
+        addPerformanceGraphSample(snapshot);
+        lastPerformanceSequence = snapshot.sequence;
+        if (lastPerformanceValuesUpdateMs < 0 ||
+                snapshot.sampledAtMs - lastPerformanceValuesUpdateMs >= 1000) {
+            showPerformanceValues(snapshot);
+            lastPerformanceValuesUpdateMs = snapshot.sampledAtMs;
+        }
+    }
+
+    private void showPerformanceValues(AudioOnlyStreamService.PerformanceSnapshot snapshot) {
         StringBuilder values = new StringBuilder();
         values.append(getString(R.string.audio_only_perf_network_rtt,
                 formatMilliseconds(snapshot.estimatedRttMs))).append('\n');
@@ -263,7 +304,9 @@ public class AudioOnlyPlayerActivity extends Activity implements AudioOnlyStream
                 formatFps(snapshot.videoReceivedFps),
                 formatPercentage(snapshot.videoFrameLossPercentage)));
         performanceValuesView.setText(values.toString());
+    }
 
+    private void addPerformanceGraphSample(AudioOnlyStreamService.PerformanceSnapshot snapshot) {
         performanceGraphView.addSample(
                 snapshot.estimatedRttMs >= 0 ? snapshot.estimatedRttMs : Float.NaN,
                 snapshot.pendingAudioDurationMs >= 0 ? snapshot.pendingAudioDurationMs : Float.NaN);
@@ -296,6 +339,10 @@ public class AudioOnlyPlayerActivity extends Activity implements AudioOnlyStream
             case AudioOnlyStreamService.STATE_CONNECTING:
                 statusView.setText(detail != null ? detail : getString(R.string.audio_only_connecting));
                 break;
+            case AudioOnlyStreamService.STATE_RECONNECTING:
+                statusView.setText(detail != null ? detail :
+                        getString(R.string.audio_only_reconnecting_now));
+                break;
             case AudioOnlyStreamService.STATE_PLAYING:
                 statusView.setText(detail != null ? detail : getString(R.string.audio_only_playing));
                 break;
@@ -315,4 +362,5 @@ public class AudioOnlyPlayerActivity extends Activity implements AudioOnlyStream
         stopButton.setEnabled(state != AudioOnlyStreamService.STATE_STOPPED &&
                 state != AudioOnlyStreamService.STATE_STOPPING);
     }
+
 }

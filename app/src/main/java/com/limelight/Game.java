@@ -196,7 +196,7 @@ public class Game extends Activity implements SurfaceHolder.Callback,
 
         // MoonBridge supports a single process-wide streaming session. Ensure an existing
         // background audio-only session relinquishes ownership before starting video.
-        if (AudioOnlyStreamService.isSessionActive()) {
+        if (AudioOnlyStreamService.isSessionActive(this)) {
             startService(new Intent(this, AudioOnlyStreamService.class)
                     .setAction(AudioOnlyStreamService.ACTION_STOP));
         }
